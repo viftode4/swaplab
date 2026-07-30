@@ -158,7 +158,7 @@
 
 <div class="step"><b>4</b>extras <span class="opt">(optional)</span></div>
 <div class="extras">
-  <button class="chip" id="voiceChip">🎤 add a voice</button>
+  <label class="chip" for="audioInput" id="voiceChip">🎤 add a voice</label>
   <button class="chip" id="capChip">💬 captions</button>
 </div>
 <div class="extras" style="margin-top:10px">
@@ -220,19 +220,20 @@ async function loadFaces() {
     b.onclick = () => { state.face = f.name; state.newFace = null; loadFaces(); ready(); };
     box.appendChild(b);
   }
-  const add = document.createElement('button');
+  const add = document.createElement('label');
+  add.htmlFor = 'faceInput';
   add.className = 'face';
   add.innerHTML = `<div class="blank">+</div><span>new face</span>`;
-  add.onclick = () => { state.pendingFaceName = null; $('faceInput').click(); };
+  add.onclick = () => { state.pendingFaceName = null; };
   box.appendChild(add);
   const sel = faces.find(f => f.name === state.face);
   $('faceInfo').hidden = !sel;
   if (sel) {
     $('faceInfo').innerHTML =
       `${sel.count} photo${sel.count > 1 ? 's' : ''} of ${sel.name} — more angles = ` +
-      `stronger identity <button class="chip mini" id="addPhoto">+ photo</button> ` +
+      `stronger identity <label class="chip mini" for="faceInput" id="addPhoto">+ photo</label> ` +
       `<button class="chip mini" id="delFace">remove</button>`;
-    $('addPhoto').onclick = () => { state.pendingFaceName = sel.name; $('faceInput').click(); };
+    $('addPhoto').onclick = () => { state.pendingFaceName = sel.name; };
     $('delFace').onclick = async () => {
       if (!confirm(`remove ${sel.name} and all their photos?`)) return;
       await fetch(`api/faces/${encodeURIComponent(sel.name)}`, { method: 'DELETE' });
@@ -270,10 +271,11 @@ async function loadClips() {
     b.onclick = () => { state.clip = c.name; state.video = null; loadClips(); ready(); };
     box.appendChild(b);
   }
-  const add = document.createElement('button');
+  // a real <label> so iOS opens the picker natively (input.click() is flaky)
+  const add = document.createElement('label');
+  add.htmlFor = 'videoInput';
   add.className = 'face' + (state.video ? ' sel' : '');
   add.innerHTML = `<div class="blank">+</div><span>${state.video ? state.video.name : 'new video'}</span>`;
-  add.onclick = () => $('videoInput').click();
   box.appendChild(add);
 }
 
@@ -283,14 +285,13 @@ $('videoInput').onchange = e => {
   loadClips(); ready();
 };
 
-$('voiceChip').onclick = () => {
-  if (state.audio) {
+$('voiceChip').onclick = e => {
+  if (state.audio) {          // second tap clears instead of opening the picker
+    e.preventDefault();
     state.audio = null;
     $('audioInput').value = '';
     $('voiceChip').textContent = '🎤 add a voice';
     $('voiceChip').classList.remove('sel');
-  } else {
-    $('audioInput').click();
   }
 };
 $('audioInput').onchange = e => {
