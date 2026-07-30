@@ -329,6 +329,9 @@ def main() -> None:
         '--processors', *processors,
         '--execution-providers', 'cpu' if args.cpu else 'coreml',
         '--video-memory-strategy', 'moderate',
+        # measured on this Mac: 62s at 1 thread, 57s at 4, 56s at 8 for the
+        # same 60 frames — 4 takes nearly all of the win at less memory
+        '--execution-thread-count', '4',
         # 'one' swaps the most prominent face every frame; 'reference' mode
         # dropped frames whenever the actor turned away from the reference pose
         '--face-selector-mode', 'one',
