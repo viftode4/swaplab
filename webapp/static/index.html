@@ -146,7 +146,9 @@
   }
   @keyframes r { to { transform: rotate(360deg); } }
   .empty { color: var(--dim); font-size: 13px; padding: 6px 2px; }
-  input[type=file] { display: none; }
+  /* only inputs explicitly marked hidden — a blanket rule here made every
+     visible picker untappable */
+  input.hidden-input { display: none; }
 </style>
 </head>
 <body>
@@ -158,20 +160,18 @@
 <div class="faces" id="faces"></div>
 <div class="faceinfo" id="faceInfo" hidden></div>
 <div class="plainpick">
-  or add a photo of someone new:
   <input type="file" id="faceInput" accept="image/*">
+  <span class="hint">adds a photo — new name creates a person, existing name
+    adds another angle to them.</span>
 </div>
 
 <div class="step"><b>2</b>onto which clip</div>
 <div class="faces clips" id="clips"></div>
 <div class="plainpick">
-  pick a video — from Photos:
-  <input type="file" id="videoInput" accept="video/*">
-  <span class="hint">if tapping this does nothing, iOS is blocking Photos:
-    Settings → Apps → Safari → Photos → Allow. Or use the Files route below
-    (save the clip to Files first).</span>
-  from Files:
-  <input type="file" id="videoInputFiles">
+  <input type="file" id="videoInput" accept="video/*,image/*">
+  <span class="hint">tap "+ new video" above or this button — both open the
+    iOS chooser (Photo Library · Take Video · Choose File). Clips saved into
+    iCloud Drive → SwapLab → inbox also appear automatically.</span>
 </div>
 
 <div class="step"><b>3</b>how fancy</div>
@@ -224,7 +224,8 @@
 <div class="step">the lab queue</div>
 <div class="strip" id="strip"><div class="empty">nothing cooking yet</div></div>
 
-<input type="file" id="audioInput" accept="audio/*,.m4a,.mp3,.wav,.ogg,.opus,.flac">
+<input class="hidden-input" type="file" id="audioInput"
+       accept="audio/*,.m4a,.mp3,.wav,.ogg,.opus,.flac">
 
 <script>
 const state = { face: null, pendingFaceName: null, video: null, clip: null,
@@ -311,10 +312,10 @@ async function loadClips() {
   // native input itself — the only picker pattern iOS never breaks
   const add = document.createElement('div');
   add.className = 'face' + (state.video ? ' sel' : '');
-  // no accept filter: iOS routes video/* straight to Photos, which opens
-  // nothing at all when Safari lacks Photos permission
+  // image/*,video/* is what makes iOS show its full sheet:
+  // Photo Library / Take Photo or Video / Choose File
   add.innerHTML = `<div class="blank">+</div><span>${state.video ? state.video.name : 'new video'}</span>
-    <input class="overlay" type="file">`;
+    <input class="overlay" type="file" accept="video/*,image/*">`;
   add.querySelector('input').onchange = onVideoPicked;
   box.appendChild(add);
 }
@@ -339,7 +340,6 @@ function onVideoPicked(e) {
   loadClips(); ready();
 }
 document.getElementById('videoInput').onchange = onVideoPicked;
-document.getElementById('videoInputFiles').onchange = onVideoPicked;
 
 $('voiceChip').onclick = e => {
   if (state.audio) {          // second tap clears instead of opening the picker

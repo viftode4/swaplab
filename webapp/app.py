@@ -28,6 +28,9 @@ from fastapi.responses import FileResponse, JSONResponse
 ROOT = Path(__file__).resolve().parent.parent
 FACES = ROOT / 'faces'
 CLIPS = ROOT / 'clips'
+# drop a clip here from the phone's Files app and it appears in the library
+INBOX = (Path.home() / 'Library/Mobile Documents/com~apple~CloudDocs'
+         / 'SwapLab' / 'inbox')
 THUMBS = CLIPS / '.thumbs'
 JOBS = ROOT / 'jobs'
 SWAP = ROOT / 'swap.py'
@@ -427,6 +430,52 @@ def run_job(path: Path, data: dict) -> None:
     write_job(path, data)
 
 
+def watch_inbox() -> None:
+    """Import clips and face photos dropped into the iCloud inbox.
+
+    Files are only taken once iCloud has finished syncing them, judged by
+    the size holding steady across two passes.
+    """
+    sizes: dict[Path, int] = {}
+    while True:
+        try:
+            entries = [p for p in INBOX.iterdir()
+                       if p.is_file() and not p.name.startswith('.')]
+        except OSError:
+            entries = []
+        for entry in entries:
+            try:
+                size = entry.stat().st_size
+            except OSError:
+                continue
+            if sizes.get(entry) != size or size == 0:
+                sizes[entry] = size          # still arriving; check again later
+                continue
+            ext = entry.suffix.lower()
+            try:
+                if ext in VIDEO_EXTS:
+                    dest = CLIPS / f'{slug(entry.stem)}{ext}'
+                    if dest.exists():
+                        dest = CLIPS / f'{slug(entry.stem)}-{secrets.token_hex(2)}{ext}'
+                    CLIPS.mkdir(exist_ok=True)
+                    shutil.move(str(entry), dest)
+                    make_thumb(dest)
+                elif ext in IMAGE_EXTS:
+                    # "vlad.jpg" or "vlad-2.jpg" both land on the person "vlad"
+                    name = slug(re.sub(r'-\d+$', '', entry.stem))
+                    person = FACES / name
+                    person.mkdir(parents=True, exist_ok=True)
+                    dest = person / f'photo-{len(person_photos(person)) + 1}{ext}'
+                    shutil.move(str(entry), dest)
+                    normalize_photo(dest)
+                else:
+                    continue
+            except OSError:
+                continue
+            sizes.pop(entry, None)
+        time.sleep(4)
+
+
 def worker() -> None:
     while True:
         queued = []
@@ -461,7 +510,9 @@ def start_worker() -> None:
                     pass
             data.update(status='queued', pid=None)
             write_job(entry, data)
+    INBOX.mkdir(parents=True, exist_ok=True)
     threading.Thread(target=worker, daemon=True).start()
+    threading.Thread(target=watch_inbox, daemon=True).start()
 
 
 def main() -> None:
