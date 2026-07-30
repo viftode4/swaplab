@@ -136,7 +136,8 @@ def make_thumb(clip: Path) -> None:
     THUMBS.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         [ffmpeg, '-y', '-v', 'error', '-ss', '0.5', '-i', str(clip),
-         '-frames:v', '1', '-vf', 'scale=320:-2', str(THUMBS / f'{clip.stem}.jpg')],
+         '-frames:v', '1', '-vf', 'scale=320:-2',
+         str(THUMBS / f'{clip.stem}.jpg')],
         capture_output=True)
 
 
@@ -399,7 +400,7 @@ def make_preview(path: Path) -> None:
     subprocess.run(
         [ffmpeg, '-y', '-v', 'error', '-i', str(path / 'result.mp4'),
          '-vf', 'scale=720:960:force_original_aspect_ratio=decrease:force_divisible_by=2',
-         '-c:v', 'libx264', '-crf', '28', '-preset', 'fast',
+         '-c:v', 'h264_videotoolbox', '-q:v', '45',
          '-c:a', 'aac', '-b:a', '96k', '-movflags', '+faststart',
          str(path / 'preview.mp4')],
         capture_output=True)

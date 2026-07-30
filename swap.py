@@ -79,6 +79,7 @@ QUALITY = {
     # fidelity stack: high-res swap, restore the original's expressions,
     # enhance at half blend so skin keeps the source footage's texture
     'best': (['face_swapper', 'expression_restorer', 'face_enhancer'], [
+        '--output-video-encoder', 'h264_videotoolbox',
         # region masking swaps only parsed face regions, so the hairline
         # and anything above it stay untouched; softer mask edge to blend
         '--face-mask-types', 'box', 'occlusion', 'region',
@@ -88,7 +89,6 @@ QUALITY = {
         '--expression-restorer-factor', '90',
         '--face-enhancer-blend', '50',
         '--output-video-quality', '95',
-        '--output-video-preset', 'slower',
     ]),
 }
 
@@ -115,6 +115,10 @@ def fail(message: str) -> 'NoReturn':
 # best pipeline gets OOM-killed. 1080p30 is past what TikTok shows anyway.
 MAX_LONG_SIDE = 1920
 MAX_FPS = 30
+
+# Apple silicon has a dedicated encode engine: several times faster than
+# libx264 and it leaves the CPU free for the actual inference work
+VIDEO_ENCODE = ['-c:v', 'h264_videotoolbox', '-q:v', '65']
 
 
 def video_stats(path: Path) -> tuple[int, int, float]:
@@ -146,8 +150,7 @@ def normalize_target(video: Path, work_dir: Path) -> Path:
           f'{"/".join(filters)} (keeps the render inside memory)', flush=True)
     result = subprocess.run(
         [shutil.which('ffmpeg'), '-y', '-v', 'error', '-i', str(video),
-         '-vf', ','.join(filters), '-c:v', 'libx264', '-preset', 'fast',
-         '-crf', '18', '-c:a', 'copy', str(scaled)],
+         '-vf', ','.join(filters), *VIDEO_ENCODE, '-c:a', 'copy', str(scaled)],
         capture_output=True, text=True)
     if result.returncode != 0 or not scaled.is_file():
         fail(f'could not normalize the clip:\n{result.stderr.strip()}')
@@ -225,8 +228,7 @@ def burn_captions(out: Path) -> None:
     burn = subprocess.run(
         [ffmpeg, '-y', '-v', 'error', '-i', str(out), *inputs,
          '-filter_complex', ';'.join(chain), '-map', f'[{current}]',
-         '-map', '0:a?', '-c:v', 'libx264', '-preset', 'fast',
-         '-crf', '18', '-c:a', 'copy', str(tmp)],
+         '-map', '0:a?', *VIDEO_ENCODE, '-c:a', 'copy', str(tmp)],
         capture_output=True, text=True)
     for png, _, _ in cards:
         png.unlink(missing_ok=True)
@@ -347,7 +349,7 @@ def main() -> None:
         if remux.returncode != 0:  # container mismatch — re-encode instead
             remux = subprocess.run(
                 [ffmpeg, '-y', '-v', 'error', '-i', str(work_out),
-                 '-c:v', 'libx264', '-preset', 'fast', '-crf', '18', '-c:a', 'aac', str(out)],
+                 *VIDEO_ENCODE, '-c:a', 'aac', str(out)],
                 capture_output=True, text=True)
         work_out.unlink(missing_ok=True)
         if remux.returncode != 0 or not out.is_file():
