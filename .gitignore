@@ -22,3 +22,6 @@ jobs/
 
 # omc state
 .omc/
+
+# clip library (private media)
+clips/

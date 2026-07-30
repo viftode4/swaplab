@@ -25,6 +25,8 @@ from fastapi.responses import FileResponse, JSONResponse
 
 ROOT = Path(__file__).resolve().parent.parent
 FACES = ROOT / 'faces'
+CLIPS = ROOT / 'clips'
+THUMBS = CLIPS / '.thumbs'
 JOBS = ROOT / 'jobs'
 SWAP = ROOT / 'swap.py'
 PYTHON = ROOT / '.venv' / 'bin' / 'python'
@@ -77,6 +79,40 @@ async def save_upload(upload: UploadFile, dest: Path) -> None:
             handle.write(chunk)
 
 
+def list_clips() -> list[dict]:
+    clips = []
+    if CLIPS.is_dir():
+        entries = sorted(CLIPS.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+        for entry in entries:
+            if entry.suffix.lower() in VIDEO_EXTS and not entry.name.startswith('.'):
+                clips.append({'name': entry.stem, 'file': entry.name})
+    return clips
+
+
+def make_thumb(clip: Path) -> None:
+    ffmpeg = shutil.which('ffmpeg')
+    if not ffmpeg:
+        return
+    THUMBS.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [ffmpeg, '-y', '-v', 'error', '-ss', '0.5', '-i', str(clip),
+         '-frames:v', '1', '-vf', 'scale=320:-2', str(THUMBS / f'{clip.stem}.jpg')],
+        capture_output=True)
+
+
+async def store_clip(video: UploadFile) -> Path:
+    """Save an uploaded video into the reusable clip library."""
+    ext = Path(video.filename or '').suffix.lower()
+    base = slug(Path(video.filename or 'clip').stem)
+    dest = CLIPS / f'{base}{ext}'
+    if dest.exists():
+        dest = CLIPS / f'{base}-{secrets.token_hex(2)}{ext}'
+    CLIPS.mkdir(exist_ok=True)
+    await save_upload(video, dest)
+    make_thumb(dest)
+    return dest
+
+
 @app.get('/')
 def index() -> FileResponse:
     return FileResponse(INDEX, media_type='text/html')
@@ -103,29 +139,58 @@ async def api_add_face(name: str = Form(...), photo: UploadFile = File(...)) -> 
     if ext not in IMAGE_EXTS:
         raise HTTPException(400, f'face photo must be one of {sorted(IMAGE_EXTS)}')
     FACES.mkdir(exist_ok=True)
-    dest = FACES / f'{slug(name)}{ext}'
+    stem = slug(name)
+    for stale in FACES.glob(f'{stem}.*'):  # same name replaces the old photo
+        stale.unlink()
+    dest = FACES / f'{stem}{ext}'
     await save_upload(photo, dest)
     return {'name': dest.stem, 'file': dest.name}
 
 
+@app.get('/api/clips')
+def api_clips() -> list[dict]:
+    return list_clips()
+
+
+@app.get('/api/clips/{file_name}/thumb')
+def api_clip_thumb(file_name: str) -> FileResponse:
+    thumb = (THUMBS / f'{Path(file_name).stem}.jpg').resolve()
+    if thumb.parent != THUMBS.resolve() or not thumb.is_file():
+        raise HTTPException(404)
+    return FileResponse(thumb, media_type='image/jpeg')
+
+
 @app.post('/api/jobs')
 async def api_create_job(
-    video: UploadFile = File(...),
+    video: UploadFile | None = File(None),
+    clip_name: str = Form(''),
     quality: str = Form('good'),
     face_name: str = Form(''),
     face_photo: UploadFile | None = File(None),
 ) -> dict:
     if quality not in QUALITIES:
         raise HTTPException(400, f'quality must be one of {sorted(QUALITIES)}')
-    video_ext = Path(video.filename or '').suffix.lower()
-    if video_ext not in VIDEO_EXTS:
-        raise HTTPException(400, f'video must be one of {sorted(VIDEO_EXTS)}')
+
+    if video is not None and video.filename:
+        video_ext = Path(video.filename).suffix.lower()
+        if video_ext not in VIDEO_EXTS:
+            raise HTTPException(400, f'video must be one of {sorted(VIDEO_EXTS)}')
+        clip = await store_clip(video)
+        video_label = video.filename
+    elif clip_name:
+        matches = [c for c in list_clips() if c['name'] == clip_name]
+        if not matches:
+            raise HTTPException(400, f'unknown clip: {clip_name}')
+        clip = CLIPS / matches[0]['file']
+        video_label = clip_name
+    else:
+        raise HTTPException(400, 'pick a clip or upload a video')
 
     job_id = f'{time.strftime("%Y%m%d-%H%M%S")}-{secrets.token_hex(3)}'
     path = JOBS / job_id
     path.mkdir(parents=True)
 
-    await save_upload(video, path / f'input{video_ext}')
+    shutil.copy(clip, path / f'input{clip.suffix.lower()}')
 
     if face_photo is not None and face_photo.filename:
         face_ext = Path(face_photo.filename).suffix.lower()
@@ -151,7 +216,7 @@ async def api_create_job(
         'status': 'queued',
         'quality': quality,
         'face': face_label,
-        'video': video.filename,
+        'video': video_label,
         'created': time.time(),
         'error': None,
     })
@@ -233,6 +298,7 @@ def worker() -> None:
 def start_worker() -> None:
     JOBS.mkdir(exist_ok=True)
     FACES.mkdir(exist_ok=True)
+    CLIPS.mkdir(exist_ok=True)
     # a crashed worker leaves 'running' jobs behind — make them re-runnable
     for entry in JOBS.iterdir():
         data = read_job(entry)

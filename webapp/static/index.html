@@ -55,18 +55,10 @@
     border: 2px dashed #3a3e46; color: var(--dim);
     display: grid; place-items: center; font-size: 30px; font-weight: 300;
   }
-
-  .drop {
-    width: 100%;
-    background: var(--panel);
-    border: 2px dashed #3a3e46;
-    border-radius: 4px;
-    color: var(--dim);
-    padding: 26px 16px;
-    font-size: 15px;
-    text-align: center;
+  .clips .face img, .clips .face .blank {
+    width: 108px; height: 76px; border-radius: 6px;
   }
-  .drop.has { border-style: solid; border-color: var(--go); color: var(--ink); }
+  .clips .face span { max-width: 112px; }
 
   .quality { display: flex; background: var(--panel); border-radius: 4px; padding: 4px; }
   .quality button {
@@ -129,7 +121,7 @@
 <div class="faces" id="faces"></div>
 
 <div class="step"><b>2</b>onto which clip</div>
-<button class="drop" id="drop">tap to pick a video</button>
+<div class="faces clips" id="clips"></div>
 
 <div class="step"><b>3</b>how fancy</div>
 <div class="quality" id="quality">
@@ -147,7 +139,7 @@
 <input type="file" id="faceInput" accept="image/*">
 
 <script>
-const state = { face: null, newFace: null, video: null, quality: 'good' };
+const state = { face: null, newFace: null, video: null, clip: null, quality: 'good' };
 
 const $ = id => document.getElementById(id);
 
@@ -172,7 +164,7 @@ async function loadFaces() {
 $('faceInput').onchange = async e => {
   const file = e.target.files[0];
   if (!file) return;
-  const name = prompt('name this face (they said yes, right?)');
+  const name = prompt('name this face (they said yes, right?)\nsame name = replaces old photo');
   if (!name) return;
   const fd = new FormData();
   fd.append('name', name);
@@ -183,12 +175,30 @@ $('faceInput').onchange = async e => {
   loadFaces(); ready();
 };
 
-$('drop').onclick = () => $('videoInput').click();
+async function loadClips() {
+  const clips = await fetch('api/clips').then(r => r.json());
+  const box = $('clips');
+  box.innerHTML = '';
+  for (const c of clips) {
+    const b = document.createElement('button');
+    b.className = 'face' + (state.clip === c.name ? ' sel' : '');
+    b.innerHTML = `<img src="api/clips/${encodeURIComponent(c.file)}/thumb"
+                        onerror="this.outerHTML='<div class=blank>🎬</div>'" alt="">
+                   <span>${c.name}</span>`;
+    b.onclick = () => { state.clip = c.name; state.video = null; loadClips(); ready(); };
+    box.appendChild(b);
+  }
+  const add = document.createElement('button');
+  add.className = 'face' + (state.video ? ' sel' : '');
+  add.innerHTML = `<div class="blank">+</div><span>${state.video ? state.video.name : 'new video'}</span>`;
+  add.onclick = () => $('videoInput').click();
+  box.appendChild(add);
+}
+
 $('videoInput').onchange = e => {
   state.video = e.target.files[0] || null;
-  $('drop').textContent = state.video ? state.video.name : 'tap to pick a video';
-  $('drop').classList.toggle('has', !!state.video);
-  ready();
+  if (state.video) state.clip = null;
+  loadClips(); ready();
 };
 
 $('quality').onclick = e => {
@@ -199,22 +209,22 @@ $('quality').onclick = e => {
 };
 
 function ready() {
-  $('go').disabled = !(state.video && state.face);
+  $('go').disabled = !((state.video || state.clip) && state.face);
 }
 
 $('go').onclick = async () => {
   const fd = new FormData();
-  fd.append('video', state.video);
+  if (state.video) fd.append('video', state.video);
+  else fd.append('clip_name', state.clip);
   fd.append('quality', state.quality);
   fd.append('face_name', state.face);
   $('go').disabled = true;
-  $('go').textContent = 'UPLOADING…';
+  $('go').textContent = state.video ? 'UPLOADING…' : 'QUEUEING…';
   try {
     const res = await fetch('api/jobs', { method: 'POST', body: fd });
     if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
     state.video = null;
-    $('drop').textContent = 'tap to pick a video';
-    $('drop').classList.remove('has');
+    loadClips();
   } catch (err) {
     alert('upload failed: ' + err.message);
   }
@@ -251,6 +261,7 @@ async function poll() {
 }
 
 loadFaces();
+loadClips();
 poll();
 setInterval(poll, 3000);
 </script>
