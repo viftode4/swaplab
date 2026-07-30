@@ -1,0 +1,21 @@
+# engine (cloned, pinned by commit in README)
+facefusion/
+
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# private media — never commit faces or footage
+faces/
+jobs/
+*.mp4
+*.mov
+*.jpg
+*.jpeg
+*.png
+!docs/**/*.png
+
+# models
+*.onnx
+.assets/
