@@ -118,8 +118,10 @@ def fail(message: str) -> 'NoReturn':
 
 # phone screen recordings run 1290x2796; at that size the four-stage best
 # pipeline gets OOM-killed, and memory scales with frame area, not frame rate.
-# Frame rate is left alone: halving it to 30 made motion judder, which reads
-# as flicker and cost far more than the enhancer ever did.
+# Frame rate is never blind-halved: fps=30 on a 60fps recording of ~30fps
+# content lands out of phase with the content cadence (measured: 15 doubled +
+# 15 dropped content frames in 9s), which is the judder an earlier attempt hit.
+# Duplicate-aware dedupe below keeps every unique content frame instead.
 MAX_LONG_SIDE = 1920
 
 # Apple silicon has a dedicated encode engine: several times faster than
@@ -216,6 +218,140 @@ def normalize_target(video: Path, work_dir: Path, crop_content: bool = False) ->
     if result.returncode != 0 or not scaled.is_file():
         fail(f'could not normalize the clip:\n{result.stderr.strip()}')
     return scaled
+
+
+def video_duration(path: Path) -> float:
+    probe = subprocess.run(
+        [shutil.which('ffprobe'), '-v', 'error', '-show_entries',
+         'format=duration', '-of', 'csv=p=0', str(path)],
+        capture_output=True, text=True)
+    return float(probe.stdout.strip())
+
+
+# a 60fps screen recording of ~30fps content duplicates every frame; the
+# swapper regenerates the face per frame, so the two copies come out visibly
+# different and the face strobes at 30Hz against a frozen background
+# (measured: face region shifted up to 31 gray levels between frozen frames)
+DUPLICATE_DIFF = 0.35     # mean gray delta below this = same content frame
+DEDUPE_WORTH_IT = 0.35    # dedupe once this share of frames is duplicated
+
+
+def duplicate_runs(video: Path) -> tuple[list[int], list[int]] | None:
+    """Group frames into runs of identical content, streaming, tiny memory.
+
+    Returns (first frame index of each run, run lengths) when enough of the
+    clip is duplicated to cause swap strobing, else None.
+    """
+    import numpy as np
+    decode = subprocess.Popen(
+        [shutil.which('ffmpeg'), '-v', 'error', '-i', str(video),
+         '-fps_mode', 'passthrough', '-vf', 'scale=128:128',
+         '-f', 'rawvideo', '-pix_fmt', 'gray', '-'],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    kept, runs, prev, index = [], [], None, 0
+    frame_bytes = 128 * 128
+    while True:
+        raw = decode.stdout.read(frame_bytes)
+        if len(raw) < frame_bytes:
+            break
+        frame = np.frombuffer(raw, dtype=np.uint8).astype(np.int16)
+        if prev is None or np.abs(frame - prev).mean() > DUPLICATE_DIFF:
+            kept.append(index)
+            runs.append(1)
+        else:
+            runs[-1] += 1
+        prev = frame
+        index += 1
+    decode.wait()
+    if index == 0 or 1 - len(kept) / index < DEDUPE_WORTH_IT:
+        return None
+    return kept, runs
+
+
+def raw_frame_pipe(video: Path) -> subprocess.Popen:
+    return subprocess.Popen(
+        [shutil.which('ffmpeg'), '-v', 'error', '-i', str(video),
+         '-fps_mode', 'passthrough', '-f', 'rawvideo',
+         '-pix_fmt', 'yuv420p', '-'],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+
+def raw_encoder(dest: Path, width: int, height: int, rate: float,
+                audio_from: Path, filters: str | None = None) -> subprocess.Popen:
+    command = [shutil.which('ffmpeg'), '-y', '-v', 'error',
+               '-f', 'rawvideo', '-pix_fmt', 'yuv420p',
+               '-s', f'{width}x{height}', '-r', f'{rate:.6f}', '-i', '-',
+               '-i', str(audio_from), '-map', '0:v', '-map', '1:a?',
+               *(['-vf', filters] if filters else []),
+               *VIDEO_ENCODE, '-c:a', 'copy', str(dest)]
+    return subprocess.Popen(command, stdin=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL)
+
+
+def write_unique_frames(video: Path, kept: list[int], total: int) -> Path:
+    """Re-encode only the first frame of each duplicate run (CFR)."""
+    width, height = video_size(video)
+    dest = video.with_name(f'.{video.stem}.unique{video.suffix}')
+    rate = len(kept) / video_duration(video)
+    decode = raw_frame_pipe(video)
+    encode = raw_encoder(dest, width, height, rate, audio_from=video)
+    frame_bytes = width * height * 3 // 2
+    keep = set(kept)
+    try:
+        for index in range(total):
+            raw = decode.stdout.read(frame_bytes)
+            if len(raw) < frame_bytes:
+                break
+            if index in keep:
+                encode.stdin.write(raw)
+        encode.stdin.close()
+    except BrokenPipeError:
+        fail('the unique-frame encoder died mid-stream')
+    decode.wait()
+    if encode.wait() != 0 or not dest.is_file():
+        fail('could not extract the unique frames')
+    return dest
+
+
+def restore_timing(swapped: Path, runs: list[int], reference: Path,
+                   out: Path, denoise: bool) -> None:
+    """Copy each swapped frame back over its original duplicate slots.
+
+    The duplicates are bit-identical, so frozen content can no longer
+    shimmer, and the timeline matches the source recording exactly.
+    """
+    width, height = video_size(swapped)
+    rate = sum(runs) / video_duration(reference)
+    tmp = out.with_name(f'.{out.stem}.timed{out.suffix}')
+    decode = raw_frame_pipe(swapped)
+    encode = raw_encoder(tmp, width, height, rate, audio_from=reference,
+                         filters='hqdn3d=2:1:20:20' if denoise else None)
+    frame_bytes = width * height * 3 // 2
+    copied = 0
+    try:
+        for length in runs:
+            raw = decode.stdout.read(frame_bytes)
+            if len(raw) < frame_bytes:
+                break
+            for _ in range(length):
+                encode.stdin.write(raw)
+            copied += 1
+        encode.stdin.close()
+    except BrokenPipeError:
+        fail('the timing encoder died mid-stream')
+    decode.wait()
+    encode_ok = encode.wait() == 0 and tmp.is_file()
+    if copied != len(runs):
+        tmp.unlink(missing_ok=True)
+        fail(f'swapped clip holds {copied} frames, expected {len(runs)} — '
+             'the swap dropped frames')
+    if not encode_ok:
+        fail('could not rebuild the original frame timing')
+    tmp.replace(out)
+    if denoise:
+        print('stabilized (temporal denoise)', flush=True)
+    print(f'restored timing: {copied} unique frames back over '
+          f'{sum(runs)}', flush=True)
 
 
 def video_size(path: Path) -> tuple[int, int]:
@@ -429,8 +565,18 @@ def main() -> None:
         fail('venv missing — run the setup in README.md first')
     out.parent.mkdir(parents=True, exist_ok=True)
 
+    reference, runs = None, None
     if video.suffix.lower() not in {'.jpg', '.jpeg', '.png', '.webp'}:
         video = normalize_target(video, out.parent, crop_content=args.screen_recording)
+        reference = video
+        duplicated = duplicate_runs(video)
+        if duplicated:
+            kept, runs = duplicated
+            total = sum(runs)
+            print(f'dedupe: {len(kept)} unique content frames of {total} '
+                  f'({1 - len(kept) / total:.0%} duplicated) — swapping '
+                  'uniques only', flush=True)
+            video = write_unique_frames(video, kept, total)
 
     # facefusion insists the output extension match the target's; swap into a
     # sibling temp file with the right extension, remux to the asked-for name
@@ -488,25 +634,34 @@ def main() -> None:
     if not work_out.is_file():
         fail('facefusion reported success but produced no output file')
 
-    if work_out != out:
-        ffmpeg = shutil.which('ffmpeg') or fail('ffmpeg is required to remux output')
-        remux = subprocess.run(
-            [ffmpeg, '-y', '-v', 'error', '-i', str(work_out), '-c', 'copy', str(out)],
-            capture_output=True, text=True)
-        if remux.returncode != 0:  # container mismatch — re-encode instead
+    if runs:
+        restore_timing(work_out, runs, reference, out,
+                       denoise=not args.no_stabilize)
+        if work_out != out:
+            work_out.unlink(missing_ok=True)
+    else:
+        if work_out != out:
+            ffmpeg = shutil.which('ffmpeg') or fail('ffmpeg is required to remux output')
             remux = subprocess.run(
-                [ffmpeg, '-y', '-v', 'error', '-i', str(work_out),
-                 *VIDEO_ENCODE, '-c:a', 'aac', str(out)],
+                [ffmpeg, '-y', '-v', 'error', '-i', str(work_out), '-c', 'copy', str(out)],
                 capture_output=True, text=True)
-        work_out.unlink(missing_ok=True)
-        if remux.returncode != 0 or not out.is_file():
-            fail(f'could not convert output to {out.suffix}:\n{remux.stderr.strip()}')
+            if remux.returncode != 0:  # container mismatch — re-encode instead
+                remux = subprocess.run(
+                    [ffmpeg, '-y', '-v', 'error', '-i', str(work_out),
+                     *VIDEO_ENCODE, '-c:a', 'aac', str(out)],
+                    capture_output=True, text=True)
+            work_out.unlink(missing_ok=True)
+            if remux.returncode != 0 or not out.is_file():
+                fail(f'could not convert output to {out.suffix}:\n{remux.stderr.strip()}')
+        if not args.no_stabilize and video.suffix.lower() not in {'.jpg', '.jpeg', '.png', '.webp'}:
+            stabilize(out)
 
-    if not args.no_stabilize and video.suffix.lower() not in {'.jpg', '.jpeg', '.png', '.webp'}:
-        stabilize(out)
     if args.captions:
         burn_captions(out)
     check_output_video(out)
+    if reference is not None and reference.is_file():
+        from check import analyze, report
+        report(analyze(reference, out))
     print(f'done: {out}')
 
 
