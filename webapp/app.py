@@ -280,6 +280,30 @@ def api_job_result(job_id: str) -> FileResponse:
                         filename=f'swap-{job_id}.mp4')
 
 
+@app.get('/api/jobs/{job_id}/preview')
+def api_job_preview(job_id: str) -> FileResponse:
+    """Mobile-data-friendly copy; falls back to the full result."""
+    path = job_dir(job_id)
+    preview = path / 'preview.mp4'
+    if preview.is_file():
+        return FileResponse(preview, media_type='video/mp4',
+                            filename=f'swap-{job_id}.mp4')
+    return api_job_result(job_id)
+
+
+def make_preview(path: Path) -> None:
+    ffmpeg = shutil.which('ffmpeg')
+    if not ffmpeg:
+        return
+    subprocess.run(
+        [ffmpeg, '-y', '-v', 'error', '-i', str(path / 'result.mp4'),
+         '-vf', 'scale=720:960:force_original_aspect_ratio=decrease:force_divisible_by=2',
+         '-c:v', 'libx264', '-crf', '28', '-preset', 'fast',
+         '-c:a', 'aac', '-b:a', '96k', '-movflags', '+faststart',
+         str(path / 'preview.mp4')],
+        capture_output=True)
+
+
 def run_job(path: Path, data: dict) -> None:
     video = next((f for f in path.iterdir() if f.stem == 'input'), None)
     face = next((f for f in path.iterdir() if f.stem == 'face'), None)
@@ -304,6 +328,7 @@ def run_job(path: Path, data: dict) -> None:
         command, stdout=log, stderr=subprocess.STDOUT, cwd=ROOT)
     log.close()
     if result.returncode == 0 and (path / 'result.mp4').is_file():
+        make_preview(path)
         data.update(status='done', finished=time.time())
     else:
         tail = (path / 'swap.log').read_text(errors='replace')[-400:].strip()
