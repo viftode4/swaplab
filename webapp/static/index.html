@@ -249,16 +249,16 @@ async function loadFaces() {
   const add = document.createElement('div');
   add.className = 'face';
   add.innerHTML = `<div class="blank">+</div><span>new face</span>
-    <input class="overlay" type="file" accept="image/*">`;
+    <input class="overlay" type="file" accept="image/*,video/*">`;
   add.querySelector('input').onchange = e => { state.pendingFaceName = null; onFacePicked(e); };
   box.appendChild(add);
   const sel = faces.find(f => f.name === state.face);
   $('faceInfo').hidden = !sel;
   if (sel) {
     $('faceInfo').innerHTML =
-      `${sel.count} photo${sel.count > 1 ? 's' : ''} of ${sel.name} — more angles = ` +
-      `stronger identity <span class="chip mini pickwrap">+ photo` +
-      `<input class="overlay" type="file" accept="image/*"></span> ` +
+      `${sel.count} photo${sel.count > 1 ? 's' : ''} of ${sel.name} — add a video ` +
+      `of them for every angle <span class="chip mini pickwrap">+ photo/video` +
+      `<input class="overlay" type="file" accept="image/*,video/*"></span> ` +
       `<button class="chip mini" id="delFace">remove</button>`;
     $('faceInfo').querySelector('.pickwrap input').onchange = e => {
       state.pendingFaceName = sel.name; onFacePicked(e);
@@ -276,14 +276,22 @@ async function onFacePicked(e) {
   const file = e.target.files[0];
   if (!file) return;
   const name = state.pendingFaceName ||
-    prompt('name this face (they said yes, right?)\nsame name = adds another photo of them');
+    prompt('name this face (they said yes, right?)\nsame name = adds more angles of them');
   if (!name) { e.target.value = ''; return; }
+  const box = $('uplog');
+  box.hidden = false; box.classList.remove('err');
+  box.textContent = `adding ${file.name} to ${name}…`;
   const fd = new FormData();
   fd.append('name', name);
   fd.append('photo', file);
-  const saved = await fetch('api/faces', { method: 'POST', body: fd }).then(r => r.json());
+  const res = await fetch('api/faces', { method: 'POST', body: fd });
+  if (!res.ok) { report('adding face failed', (await res.json()).detail); return; }
+  const saved = await res.json();
   state.face = saved.name;
   e.target.value = '';
+  box.textContent = saved.added > 1
+    ? `${saved.name}: pulled ${saved.added} angles from that video (${saved.count} total) ✓`
+    : `${saved.name}: ${saved.count} photo${saved.count > 1 ? 's' : ''} ✓`;
   loadFaces(); ready();
 }
 

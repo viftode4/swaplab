@@ -189,18 +189,61 @@ def api_face_thumb(name: str) -> FileResponse:
     return FileResponse(photos[0])
 
 
+FACE_VIDEO_SAMPLES = 8
+
+
+def sample_face_video(clip: Path, person: Path, start_index: int) -> int:
+    """Pull evenly spaced stills out of a video of one person.
+
+    A single frontal photo can only describe a face head-on; frames from a
+    few seconds of someone moving cover the angles the swap actually needs.
+    """
+    ffmpeg = shutil.which('ffmpeg')
+    if not ffmpeg:
+        return 0
+    probe = subprocess.run(
+        [shutil.which('ffprobe'), '-v', 'error', '-show_entries',
+         'format=duration', '-of', 'csv=p=0', str(clip)],
+        capture_output=True, text=True)
+    try:
+        duration = float(probe.stdout.strip())
+    except ValueError:
+        return 0
+    taken = 0
+    for i in range(FACE_VIDEO_SAMPLES):
+        # skip the very start and end, where phone clips tend to be blurry
+        at = duration * (i + 1) / (FACE_VIDEO_SAMPLES + 1)
+        dest = person / f'photo-{start_index + taken + 1}.jpg'
+        result = subprocess.run(
+            [ffmpeg, '-y', '-v', 'error', '-ss', f'{at:.2f}', '-i', str(clip),
+             '-frames:v', '1', '-q:v', '2', str(dest)], capture_output=True)
+        if result.returncode == 0 and dest.is_file():
+            taken += 1
+    return taken
+
+
 @app.post('/api/faces')
 async def api_add_face(name: str = Form(...), photo: UploadFile = File(...)) -> dict:
     ext = Path(photo.filename or '').suffix.lower()
-    if ext not in IMAGE_EXTS:
-        raise HTTPException(400, f'face photo must be one of {sorted(IMAGE_EXTS)}')
+    if ext not in IMAGE_EXTS | VIDEO_EXTS:
+        raise HTTPException(400, 'a face needs a photo or a short video of them')
     person = FACES / slug(name)
     person.mkdir(parents=True, exist_ok=True)
     count = len(person_photos(person))
+
+    if ext in VIDEO_EXTS:
+        clip = person / f'.source{ext}'
+        await save_upload(photo, clip)
+        added = sample_face_video(clip, person, count)
+        clip.unlink(missing_ok=True)
+        if not added:
+            raise HTTPException(400, 'could not read frames from that video')
+        return {'name': person.name, 'count': count + added, 'added': added}
+
     dest = person / f'photo-{count + 1}{ext}'
     await save_upload(photo, dest)
     normalize_photo(dest)
-    return {'name': person.name, 'count': count + 1}
+    return {'name': person.name, 'count': count + 1, 'added': 1}
 
 
 @app.delete('/api/faces/{name}')
