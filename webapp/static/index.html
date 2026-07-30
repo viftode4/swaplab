@@ -41,7 +41,10 @@
   .step b { color: var(--go); font-weight: 700; margin-right: 6px; }
 
   .faces { display: flex; gap: 12px; overflow-x: auto; padding: 4px 2px 10px; }
-  .face { flex: 0 0 auto; text-align: center; background: none; border: 0; color: var(--dim); }
+  .face { flex: 0 0 auto; text-align: center; background: none; border: 0; color: var(--dim);
+          position: relative; }
+  input.overlay { position: absolute; inset: 0; width: 100%; height: 100%;
+                  opacity: 0; display: block; }
   .face img, .face .blank {
     width: 76px; height: 76px; border-radius: 50%;
     object-fit: cover; display: block;
@@ -127,6 +130,12 @@
   .job a.hd {
     background: none; color: var(--go); border: 1px solid #3a3e46; padding: 8px 10px;
   }
+  .uplog { margin-top: 10px; font-size: 12px; color: var(--dim);
+           font-variant-numeric: tabular-nums; white-space: pre-wrap; }
+  .uplog.err { color: var(--bad); }
+  .bar { height: 3px; background: #2a2d33; border-radius: 2px; margin-top: 7px; }
+  .bar i { display: block; height: 100%; background: var(--go); border-radius: 2px;
+           transition: width .6s; }
   .spin {
     width: 16px; height: 16px; flex-shrink: 0;
     border: 2px solid #3a3e46; border-top-color: var(--go);
@@ -194,11 +203,11 @@
 </div>
 
 <button id="go" disabled>SWAP IT</button>
+<div class="uplog" id="uplog" hidden></div>
 
 <div class="step">the lab queue</div>
 <div class="strip" id="strip"><div class="empty">nothing cooking yet</div></div>
 
-<input type="file" id="videoInput" accept="video/mp4,video/quicktime,video/webm,video/*">
 <input type="file" id="faceInput" accept="image/*">
 <input type="file" id="audioInput" accept="audio/*,.m4a,.mp3,.wav,.ogg,.opus,.flac">
 
@@ -271,19 +280,21 @@ async function loadClips() {
     b.onclick = () => { state.clip = c.name; state.video = null; loadClips(); ready(); };
     box.appendChild(b);
   }
-  // a real <label> so iOS opens the picker natively (input.click() is flaky)
-  const add = document.createElement('label');
-  add.htmlFor = 'videoInput';
+  // invisible file input stretched over the tile: the tap lands on the
+  // native input itself — the only picker pattern iOS never breaks
+  const add = document.createElement('div');
   add.className = 'face' + (state.video ? ' sel' : '');
-  add.innerHTML = `<div class="blank">+</div><span>${state.video ? state.video.name : 'new video'}</span>`;
+  add.innerHTML = `<div class="blank">+</div><span>${state.video ? state.video.name : 'new video'}</span>
+    <input class="overlay" type="file" accept="video/mp4,video/quicktime,video/webm,video/*">`;
+  add.querySelector('input').onchange = onVideoPicked;
   box.appendChild(add);
 }
 
-$('videoInput').onchange = e => {
+function onVideoPicked(e) {
   state.video = e.target.files[0] || null;
   if (state.video) state.clip = null;
   loadClips(); ready();
-};
+}
 
 $('voiceChip').onclick = e => {
   if (state.audio) {          // second tap clears instead of opening the picker
@@ -354,20 +365,25 @@ $('go').onclick = async () => {
   if (Object.keys(ed).length) fd.append('edit', JSON.stringify(ed));
   $('go').disabled = true;
   $('go').textContent = state.video ? 'UPLOADING 0%' : 'QUEUEING…';
+  const log = m => { $('uplog').hidden = false; $('uplog').classList.remove('err'); $('uplog').textContent = m; };
+  log(state.video ? `starting upload: ${state.video.name} (${(state.video.size / 1e6).toFixed(1)}MB)` : 'queueing…');
   try {
     await new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open('POST', 'api/jobs');
       xhr.timeout = 0;
       xhr.upload.onprogress = e => {
-        if (e.lengthComputable && state.video)
-          $('go').textContent = `UPLOADING ${Math.round(100 * e.loaded / e.total)}%`;
+        if (e.lengthComputable && state.video) {
+          const pct = Math.round(100 * e.loaded / e.total);
+          $('go').textContent = `UPLOADING ${pct}%`;
+          log(`uploading ${pct}% — ${(e.loaded / 1e6).toFixed(1)} of ${(e.total / 1e6).toFixed(1)}MB`);
+        }
       };
       xhr.onload = () => {
-        if (xhr.status < 300) return resolve();
+        if (xhr.status < 300) { log('upload complete — queued ✓'); return resolve(); }
         let detail = xhr.statusText;
         try { detail = JSON.parse(xhr.responseText).detail || detail; } catch {}
-        reject(new Error(detail));
+        reject(new Error(`server said ${xhr.status}: ${detail}`));
       };
       xhr.onerror = () => reject(new Error('connection dropped mid-upload — try again'));
       xhr.ontimeout = () => reject(new Error('upload timed out'));
@@ -380,7 +396,9 @@ $('go').onclick = async () => {
     $('voiceChip').classList.remove('sel');
     loadClips();
   } catch (err) {
-    alert('upload failed: ' + err.message);
+    $('uplog').hidden = false;
+    $('uplog').classList.add('err');
+    $('uplog').textContent = '✕ ' + err.message;
   }
   $('go').textContent = 'SWAP IT';
   ready();
@@ -388,8 +406,13 @@ $('go').onclick = async () => {
 };
 
 function fmtAge(j) {
-  if (j.status === 'running' && j.started)
-    return `running ${Math.round((Date.now() / 1000 - j.started))}s`;
+  if (j.status === 'running') {
+    const t = j.started ? `${Math.round(Date.now() / 1000 - j.started)}s` : '';
+    return j.progress ? `${j.progress.stage} ${j.progress.pct}% · ${t}`
+                      : `starting up · ${t}`;
+  }
+  if (j.status === 'queued')
+    return j.place > 1 ? `queued · #${j.place} in line` : 'queued · up next';
   if (j.status === 'done' && j.finished && j.started)
     return `done in ${Math.round(j.finished - j.started)}s · ${j.quality}`;
   return j.status + ' · ' + j.quality;
@@ -412,7 +435,9 @@ async function poll() {
     const sub = j.status === 'failed'
       ? `<div class="sub err">${j.error || 'failed'}</div>`
       : `<div class="sub">${fmtAge(j)}${extras}</div>`;
-    div.innerHTML = `${spin}<div class="meta"><div class="name">${j.face} → ${j.video}</div>${sub}</div>${link}`;
+    const bar = (j.status === 'running' && j.progress)
+      ? `<div class="bar"><i style="width:${j.progress.pct}%"></i></div>` : '';
+    div.innerHTML = `${spin}<div class="meta"><div class="name">${j.face} → ${j.video}</div>${sub}${bar}</div>${link}`;
     strip.appendChild(div);
   }
 }

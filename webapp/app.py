@@ -289,6 +289,28 @@ async def api_create_job(
     return {'id': job_id}
 
 
+PROGRESS_RE = re.compile(rb'(downloading|analysing|extracting|processing|merging):\s*(\d+)%')
+STAGE_LABEL = {'downloading': 'fetching models', 'analysing': 'analysing',
+               'extracting': 'reading frames', 'processing': 'swapping',
+               'merging': 'writing video'}
+
+
+def job_progress(path: Path) -> dict | None:
+    """Last progress marker from swap.log (facefusion prints tqdm lines)."""
+    log = path / 'swap.log'
+    try:
+        with log.open('rb') as handle:
+            handle.seek(max(0, log.stat().st_size - 8192))
+            found = PROGRESS_RE.findall(handle.read())
+        if found:
+            stage, pct = found[-1]
+            return {'stage': STAGE_LABEL.get(stage.decode(), stage.decode()),
+                    'pct': int(pct)}
+    except OSError:
+        pass
+    return None
+
+
 @app.get('/api/jobs')
 def api_jobs() -> list[dict]:
     jobs = []
@@ -296,8 +318,14 @@ def api_jobs() -> list[dict]:
         for entry in JOBS.iterdir():
             data = read_job(entry)
             if data:
+                if data.get('status') == 'running':
+                    data['progress'] = job_progress(entry)
                 jobs.append(data)
     jobs.sort(key=lambda j: j.get('created', 0), reverse=True)
+    queued = sorted((j for j in jobs if j.get('status') == 'queued'),
+                    key=lambda j: j.get('created', 0))
+    for position, job in enumerate(queued, start=1):
+        job['place'] = position
     return jobs[:30]
 
 
@@ -426,7 +454,8 @@ def main() -> None:
                         help='bind address (LAN/Tailscale only — never expose publicly)')
     parser.add_argument('--port', type=int, default=8877)
     args = parser.parse_args()
-    uvicorn.run(app, host=args.host, port=args.port, log_level='warning')
+    uvicorn.run(app, host=args.host, port=args.port, log_level='info',
+                access_log=True)
 
 
 if __name__ == '__main__':
