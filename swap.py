@@ -22,7 +22,12 @@ PYTHON = ROOT / '.venv' / 'bin' / 'python'
 QUALITY = {
     'fast': (['face_swapper'], []),
     'good': (['face_swapper', 'face_enhancer'], []),
-    'best': (['face_swapper', 'face_enhancer'], [
+    # fidelity stack: high-res swap, restore the original's expressions,
+    # enhance at half blend so skin keeps the source footage's texture
+    'best': (['face_swapper', 'expression_restorer', 'face_enhancer'], [
+        '--face-swapper-pixel-boost', '512x512',
+        '--expression-restorer-factor', '90',
+        '--face-enhancer-blend', '50',
         '--output-video-quality', '95',
         '--output-video-preset', 'slower',
     ]),
