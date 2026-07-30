@@ -299,6 +299,56 @@ def burn_captions(out: Path) -> None:
     print(f'captions: burned {len(cards)} lines')
 
 
+# facefusion's memory use grows as it works — frame times on a long clip drift
+# from 2s to 10s and macOS eventually kills it. Each chunk is a fresh process,
+# so whatever leaked is reclaimed between them.
+CHUNK_FRAMES = 150
+
+
+def video_frames(path: Path) -> int:
+    probe = subprocess.run(
+        [shutil.which('ffprobe'), '-v', 'error', '-select_streams', 'v:0',
+         '-count_packets', '-show_entries', 'stream=nb_read_packets',
+         '-of', 'csv=p=0', str(path)], capture_output=True, text=True)
+    try:
+        return int(probe.stdout.strip())
+    except ValueError:
+        return 0
+
+
+def run_in_chunks(command: list[str], work_out: Path, frame_count: int) -> None:
+    output_at = command.index('--output-path') + 1
+    total = -(-frame_count // CHUNK_FRAMES)
+    chunks = []
+    for index, start in enumerate(range(0, frame_count, CHUNK_FRAMES)):
+        end = min(start + CHUNK_FRAMES, frame_count)
+        piece = work_out.with_name(f'.{work_out.stem}.part{index}{work_out.suffix}')
+        print(f'chunk {index + 1}/{total} (frames {start}-{end})', flush=True)
+        chunk_command = list(command)
+        chunk_command[output_at] = str(piece)
+        chunk_command += ['--trim-frame-start', str(start),
+                          '--trim-frame-end', str(end)]
+        result = subprocess.run(chunk_command, cwd=FACEFUSION)
+        if result.returncode != 0 or not piece.is_file():
+            for done in chunks:
+                done.unlink(missing_ok=True)
+            fail(f'facefusion exited with {result.returncode} on chunk '
+                 f'{index + 1} of {total}')
+        chunks.append(piece)
+
+    listing = work_out.with_name(f'.{work_out.stem}.chunks.txt')
+    listing.write_text(''.join(f"file '{p.name}'\n" for p in chunks))
+    concat = subprocess.run(
+        [shutil.which('ffmpeg'), '-y', '-v', 'error', '-f', 'concat',
+         '-safe', '0', '-i', str(listing), '-c', 'copy', str(work_out)],
+        capture_output=True, text=True)
+    listing.unlink(missing_ok=True)
+    for piece in chunks:
+        piece.unlink(missing_ok=True)
+    if concat.returncode != 0:
+        fail(f'could not join the rendered chunks:\n{concat.stderr.strip()}')
+
+
 def stabilize(out: Path) -> None:
     """Damp the frame-to-frame shimmer a per-frame swapper leaves behind.
 
@@ -427,10 +477,14 @@ def main() -> None:
         '--face-selector-mode', 'one',
         *extra,
     ]
-    result = subprocess.run(command, cwd=FACEFUSION)
-    if result.returncode != 0:
-        fail(f'facefusion exited with {result.returncode} '
-             '(no face in photo/video and codec issues are the usual causes)')
+    frame_count = video_frames(video)
+    if frame_count > CHUNK_FRAMES * 1.5:
+        run_in_chunks(command, work_out, frame_count)
+    else:
+        result = subprocess.run(command, cwd=FACEFUSION)
+        if result.returncode != 0:
+            fail(f'facefusion exited with {result.returncode} '
+                 '(no face in photo/video and codec issues are the usual causes)')
     if not work_out.is_file():
         fail('facefusion reported success but produced no output file')
 
