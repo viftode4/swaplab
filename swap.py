@@ -75,7 +75,8 @@ OCCLUSION = ['--face-mask-types', 'box', 'occlusion',
 # quality tier -> (processors, extra facefusion args)
 QUALITY = {
     'fast': (['face_swapper'], []),
-    'good': (['face_swapper', 'face_enhancer'], [*OCCLUSION]),
+    'good': (['face_swapper', 'face_enhancer'],
+             [*OCCLUSION, '--face-enhancer-blend', '25']),
     # fidelity stack: high-res swap, restore the original's expressions,
     # enhance at half blend so skin keeps the source footage's texture
     'best': (['face_swapper', 'expression_restorer', 'face_enhancer'], [
@@ -87,7 +88,10 @@ QUALITY = {
         '--face-mask-blur', '0.4',
         '--face-swapper-pixel-boost', '512x512',
         '--expression-restorer-factor', '90',
-        '--face-enhancer-blend', '50',
+        # measured face-region jitter over the source: swap alone +0.52,
+        # enhancer at 25 +0.66, at 50 +0.89. The enhancer sharpens a paused
+        # frame but reinvents skin detail every frame, which reads as flicker
+        '--face-enhancer-blend', '25',
         '--output-video-quality', '95',
     ]),
 }
