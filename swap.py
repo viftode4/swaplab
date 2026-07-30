@@ -111,6 +111,49 @@ def fail(message: str) -> 'NoReturn':
     sys.exit(1)
 
 
+# phone screen recordings run 1290x2796 at 60fps; at that size the four-stage
+# best pipeline gets OOM-killed. 1080p30 is past what TikTok shows anyway.
+MAX_LONG_SIDE = 1920
+MAX_FPS = 30
+
+
+def video_stats(path: Path) -> tuple[int, int, float]:
+    ffprobe = shutil.which('ffprobe')
+    probe = subprocess.run(
+        [ffprobe, '-v', 'error', '-select_streams', 'v:0', '-show_entries',
+         'stream=width,height,r_frame_rate', '-of', 'csv=p=0', str(path)],
+        capture_output=True, text=True)
+    width, height, rate = probe.stdout.strip().split(',')[:3]
+    num, _, den = rate.partition('/')
+    fps = float(num) / float(den or 1)
+    return int(width), int(height), fps
+
+
+def normalize_target(video: Path, work_dir: Path) -> Path:
+    """Cap resolution and frame rate so big phone clips fit in memory."""
+    width, height, fps = video_stats(video)
+    if max(width, height) <= MAX_LONG_SIDE and fps <= MAX_FPS + 0.5:
+        return video
+
+    scaled = work_dir / f'.{video.stem}.normalized{video.suffix.lower()}'
+    filters = []
+    if max(width, height) > MAX_LONG_SIDE:
+        filters.append(f'scale={MAX_LONG_SIDE}:{MAX_LONG_SIDE}'
+                       ':force_original_aspect_ratio=decrease:force_divisible_by=2')
+    if fps > MAX_FPS + 0.5:
+        filters.append(f'fps={MAX_FPS}')
+    print(f'normalizing {width}x{height}@{fps:.0f} -> '
+          f'{"/".join(filters)} (keeps the render inside memory)', flush=True)
+    result = subprocess.run(
+        [shutil.which('ffmpeg'), '-y', '-v', 'error', '-i', str(video),
+         '-vf', ','.join(filters), '-c:v', 'libx264', '-preset', 'fast',
+         '-crf', '18', '-c:a', 'copy', str(scaled)],
+        capture_output=True, text=True)
+    if result.returncode != 0 or not scaled.is_file():
+        fail(f'could not normalize the clip:\n{result.stderr.strip()}')
+    return scaled
+
+
 def video_size(path: Path) -> tuple[int, int]:
     ffprobe = shutil.which('ffprobe')
     probe = subprocess.run(
@@ -245,6 +288,9 @@ def main() -> None:
         fail('venv missing — run the setup in README.md first')
     out.parent.mkdir(parents=True, exist_ok=True)
 
+    if video.suffix.lower() not in {'.jpg', '.jpeg', '.png', '.webp'}:
+        video = normalize_target(video, out.parent)
+
     # facefusion insists the output extension match the target's; swap into a
     # sibling temp file with the right extension, remux to the asked-for name
     work_out = out
@@ -280,6 +326,7 @@ def main() -> None:
         '--output-path', str(work_out),
         '--processors', *processors,
         '--execution-providers', 'cpu' if args.cpu else 'coreml',
+        '--video-memory-strategy', 'moderate',
         # 'one' swaps the most prominent face every frame; 'reference' mode
         # dropped frames whenever the actor turned away from the reference pose
         '--face-selector-mode', 'one',
