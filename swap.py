@@ -67,8 +67,10 @@ def parse_edits(pairs: list[str] | None, puppet: str | None) -> dict[str, float]
 
 # occlusion masking keeps hair/hands/props in front of the face on top of
 # the swap instead of being painted over (xseg segmenter, per-frame cost)
+# xseg_1 specifically: the 'many' ensemble includes xseg_2, which produces an
+# empty mask here and silently erases the whole swap (verified frame by frame)
 OCCLUSION = ['--face-mask-types', 'box', 'occlusion',
-             '--face-occluder-model', 'many']
+             '--face-occluder-model', 'xseg_1']
 
 # quality tier -> (processors, extra facefusion args)
 QUALITY = {
@@ -80,7 +82,7 @@ QUALITY = {
         # region masking swaps only parsed face regions, so the hairline
         # and anything above it stay untouched; softer mask edge to blend
         '--face-mask-types', 'box', 'occlusion', 'region',
-        '--face-occluder-model', 'many',
+        '--face-occluder-model', 'xseg_1',
         '--face-mask-blur', '0.4',
         '--face-swapper-pixel-boost', '512x512',
         '--expression-restorer-factor', '90',
