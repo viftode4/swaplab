@@ -172,6 +172,7 @@
 <div class="extras">
   <label class="chip" for="audioInput" id="voiceChip">🎤 add a voice</label>
   <button class="chip" id="capChip">💬 captions</button>
+  <button class="chip" id="screenChip">📱 screen recording</button>
 </div>
 <div class="extras" style="margin-top:10px">
   <button class="chip" id="editChip">🎭 face editor</button>
@@ -216,7 +217,8 @@
 
 <script>
 const state = { face: null, pendingFaceName: null, video: null, clip: null,
-                quality: 'good', audio: null, captions: false };
+                quality: 'good', audio: null, captions: false,
+                screenRecording: false };
 
 // a phone has no console we can read: show failures and report them home
 function report(where, detail) {
@@ -391,6 +393,10 @@ $('capChip').onclick = () => {
   state.captions = !state.captions;
   $('capChip').classList.toggle('sel', state.captions);
 };
+$('screenChip').onclick = () => {
+  state.screenRecording = !state.screenRecording;
+  $('screenChip').classList.toggle('sel', state.screenRecording);
+};
 const sliders = [...document.querySelectorAll('#editor input[type=range]')];
 
 function edits() {
@@ -438,6 +444,7 @@ $('go').onclick = async () => {
   fd.append('face_name', state.face);
   if (state.audio) fd.append('audio', state.audio);
   if (state.captions) fd.append('captions', 'true');
+  if (state.screenRecording) fd.append('screen_recording', 'true');
   const ed = edits();
   if (Object.keys(ed).length) fd.append('edit', JSON.stringify(ed));
   $('go').disabled = true;

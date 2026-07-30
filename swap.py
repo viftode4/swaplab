@@ -138,17 +138,76 @@ def video_stats(path: Path) -> tuple[int, int, float]:
     return int(width), int(height), fps
 
 
-def normalize_target(video: Path, work_dir: Path) -> Path:
-    """Cap resolution so big phone clips fit in memory; keep the frame rate."""
+def content_box(video: Path) -> tuple[int, int, int, int] | None:
+    """Find the moving region of a screen recording.
+
+    Phone UI (status bar, buttons, captions) is static; the played video is
+    not. Pixels whose brightness varies over time therefore mark the actual
+    content, and cropping to it makes the face far bigger for the detector.
+    """
+    width, height, _ = video_stats(video)
+    small_w, small_h = 160, int(160 * height / width) // 2 * 2
+    raw = subprocess.run(
+        [shutil.which('ffmpeg'), '-v', 'error', '-i', str(video),
+         '-vf', f'scale={small_w}:{small_h},fps=4', '-frames:v', '40',
+         '-f', 'rawvideo', '-pix_fmt', 'gray', '-'],
+        capture_output=True).stdout
+    import numpy as np
+    frames = np.frombuffer(raw, dtype=np.uint8)
+    count = len(frames) // (small_w * small_h)
+    if count < 8:
+        return None
+    frames = frames[:count * small_w * small_h].reshape(count, small_h, small_w).astype(float)
+
+    motion = frames.std(axis=0)
+    moving = motion > max(3.0, motion.max() * 0.15)
+    rows = np.where(moving.any(axis=1))[0]
+    cols = np.where(moving.any(axis=0))[0]
+    if not len(rows) or not len(cols):
+        return None
+
+    scale_x, scale_y = width / small_w, height / small_h
+    left, right = int(cols[0] * scale_x), int((cols[-1] + 1) * scale_x)
+    top, bottom = int(rows[0] * scale_y), int((rows[-1] + 1) * scale_y)
+    box_w, box_h = right - left, bottom - top
+    if box_w * box_h > 0.92 * width * height:
+        return None                      # nothing meaningful to crop away
+    if box_w < width * 0.25 or box_h < height * 0.25:
+        return None                      # too aggressive to trust
+    return (box_w // 2 * 2, box_h // 2 * 2, left // 2 * 2, top // 2 * 2)
+
+
+def normalize_target(video: Path, work_dir: Path, crop_content: bool = False) -> Path:
+    """Crop a screen recording to its content; cap resolution for memory."""
     width, height, fps = video_stats(video)
-    if max(width, height) <= MAX_LONG_SIDE:
+    filters = []
+
+    if crop_content:
+        box = content_box(video)
+        if box:
+            box_w, box_h, left, top = box
+            filters.append(f'crop={box_w}:{box_h}:{left}:{top}')
+            print(f'screen recording: cropping to the moving area '
+                  f'{box_w}x{box_h} at {left},{top}', flush=True)
+            width, height = box_w, box_h
+        else:
+            print('screen recording: no static border found, keeping the '
+                  'full frame', flush=True)
+
+    if max(width, height) > MAX_LONG_SIDE:
+        filters.append(f'scale={MAX_LONG_SIDE}:{MAX_LONG_SIDE}'
+                       ':force_original_aspect_ratio=decrease:force_divisible_by=2')
+    elif crop_content and filters and max(width, height) < MAX_LONG_SIDE:
+        # a cropped region is small; upscaling gives the detector more to work
+        # with and the swapper a larger face crop to paste back
+        filters.append(f'scale={MAX_LONG_SIDE}:{MAX_LONG_SIDE}'
+                       ':force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos')
+
+    if not filters:
         return video
 
     scaled = work_dir / f'.{video.stem}.normalized{video.suffix.lower()}'
-    filters = [f'scale={MAX_LONG_SIDE}:{MAX_LONG_SIDE}'
-               ':force_original_aspect_ratio=decrease:force_divisible_by=2']
-    print(f'normalizing {width}x{height}@{fps:.0f} -> '
-          f'{"/".join(filters)} (keeps the render inside memory)', flush=True)
+    print(f'preparing {width}x{height}@{fps:.0f}', flush=True)
     result = subprocess.run(
         [shutil.which('ffmpeg'), '-y', '-v', 'error', '-i', str(video),
          '-vf', ','.join(filters), *VIDEO_ENCODE, '-c:a', 'copy', str(scaled)],
@@ -264,6 +323,8 @@ def main() -> None:
     parser.add_argument('--audio', help='voice/music track to lip-sync the face to')
     parser.add_argument('--captions', action='store_true',
                         help='transcribe speech locally and burn subtitles in')
+    parser.add_argument('--screen-recording', action='store_true',
+                        help='crop away the static phone UI and zoom the content')
     parser.add_argument('--edit', action='append', metavar='CONTROL=VALUE',
                         help=f'face editor slider, -1.0..1.0 (repeatable): {", ".join(EDIT_CONTROLS)}')
     parser.add_argument('--puppet', choices=PUPPETS,
@@ -292,7 +353,7 @@ def main() -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
 
     if video.suffix.lower() not in {'.jpg', '.jpeg', '.png', '.webp'}:
-        video = normalize_target(video, out.parent)
+        video = normalize_target(video, out.parent, crop_content=args.screen_recording)
 
     # facefusion insists the output extension match the target's; swap into a
     # sibling temp file with the right extension, remux to the asked-for name

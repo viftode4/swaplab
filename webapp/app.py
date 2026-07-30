@@ -287,6 +287,7 @@ async def api_create_job(
     audio: UploadFile | None = File(None),
     captions: bool = Form(False),
     edit: str = Form(''),
+    screen_recording: bool = Form(False),
 ) -> dict:
     if quality not in QUALITIES:
         raise HTTPException(400, f'quality must be one of {sorted(QUALITIES)}')
@@ -361,6 +362,7 @@ async def api_create_job(
         'audio': audio_label,
         'captions': captions,
         'edit': edits or None,
+        'screen_recording': screen_recording,
         'created': time.time(),
         'error': None,
     })
@@ -464,6 +466,8 @@ def run_job(path: Path, data: dict) -> None:
         command += ['--audio', str(audio)]
     if data.get('captions'):
         command += ['--captions']
+    if data.get('screen_recording'):
+        command += ['--screen-recording']
     for control, value in (data.get('edit') or {}).items():
         command += ['--edit', f'{control}={value}']
     if data.get('swapper_model'):
