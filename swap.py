@@ -246,8 +246,9 @@ def main() -> None:
         '--output-path', str(work_out),
         '--processors', *processors,
         '--execution-providers', 'cpu' if args.cpu else 'coreml',
-        # keep the swap on one person: match the reference face across frames
-        '--face-selector-mode', 'reference',
+        # 'one' swaps the most prominent face every frame; 'reference' mode
+        # dropped frames whenever the actor turned away from the reference pose
+        '--face-selector-mode', 'one',
         *extra,
     ]
     result = subprocess.run(command, cwd=FACEFUSION)
