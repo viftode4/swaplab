@@ -69,13 +69,32 @@ def write_job(path: Path, data: dict) -> None:
     tmp.replace(path / 'job.json')
 
 
+def person_photos(person: Path) -> list[Path]:
+    return sorted(p for p in person.iterdir()
+                  if p.suffix.lower() in IMAGE_EXTS and not p.name.startswith('.'))
+
+
 def list_faces() -> list[dict]:
+    """Each face is a directory of photos of one consented person."""
     faces = []
     if FACES.is_dir():
         for entry in sorted(FACES.iterdir()):
-            if entry.suffix.lower() in IMAGE_EXTS and not entry.name.startswith('.'):
-                faces.append({'name': entry.stem, 'file': entry.name})
+            if entry.is_dir() and not entry.name.startswith('.'):
+                photos = person_photos(entry)
+                if photos:
+                    faces.append({'name': entry.name, 'count': len(photos)})
     return faces
+
+
+def migrate_flat_faces() -> None:
+    """Old layout was one photo per person as faces/<name>.<ext>."""
+    if not FACES.is_dir():
+        return
+    for entry in list(FACES.iterdir()):
+        if entry.is_file() and entry.suffix.lower() in IMAGE_EXTS:
+            person = FACES / entry.stem
+            person.mkdir(exist_ok=True)
+            entry.rename(person / f'photo-1{entry.suffix.lower()}')
 
 
 async def save_upload(upload: UploadFile, dest: Path) -> None:
@@ -128,14 +147,20 @@ def api_faces() -> list[dict]:
     return list_faces()
 
 
-@app.get('/api/faces/{file_name}')
-def api_face_image(file_name: str) -> FileResponse:
-    target = (FACES / file_name).resolve()
-    if target.parent != FACES.resolve() or target.suffix.lower() not in IMAGE_EXTS:
+def person_dir(name: str) -> Path:
+    target = (FACES / name).resolve()
+    if target.parent != FACES.resolve():
         raise HTTPException(404)
-    if not target.is_file():
+    return target
+
+
+@app.get('/api/faces/{name}/thumb')
+def api_face_thumb(name: str) -> FileResponse:
+    person = person_dir(name)
+    photos = person_photos(person) if person.is_dir() else []
+    if not photos:
         raise HTTPException(404)
-    return FileResponse(target)
+    return FileResponse(photos[0])
 
 
 @app.post('/api/faces')
@@ -143,13 +168,20 @@ async def api_add_face(name: str = Form(...), photo: UploadFile = File(...)) -> 
     ext = Path(photo.filename or '').suffix.lower()
     if ext not in IMAGE_EXTS:
         raise HTTPException(400, f'face photo must be one of {sorted(IMAGE_EXTS)}')
-    FACES.mkdir(exist_ok=True)
-    stem = slug(name)
-    for stale in FACES.glob(f'{stem}.*'):  # same name replaces the old photo
-        stale.unlink()
-    dest = FACES / f'{stem}{ext}'
-    await save_upload(photo, dest)
-    return {'name': dest.stem, 'file': dest.name}
+    person = FACES / slug(name)
+    person.mkdir(parents=True, exist_ok=True)
+    count = len(person_photos(person))
+    await save_upload(photo, person / f'photo-{count + 1}{ext}')
+    return {'name': person.name, 'count': count + 1}
+
+
+@app.delete('/api/faces/{name}')
+def api_delete_face(name: str) -> dict:
+    person = person_dir(name)
+    if not person.is_dir():
+        raise HTTPException(404)
+    shutil.rmtree(person)
+    return {'deleted': name}
 
 
 @app.get('/api/clips')
@@ -217,12 +249,14 @@ async def api_create_job(
         await save_upload(face_photo, path / f'face{face_ext}')
         face_label = 'uploaded photo'
     elif face_name:
-        matches = [f for f in list_faces() if f['name'] == face_name]
-        if not matches:
+        person = FACES / face_name
+        photos = person_photos(person) if person.is_dir() else []
+        if not photos:
             shutil.rmtree(path)
             raise HTTPException(400, f'unknown face: {face_name}')
-        source = FACES / matches[0]['file']
-        shutil.copy(source, path / f'face{source.suffix.lower()}')
+        (path / 'face').mkdir()
+        for photo in photos:
+            shutil.copy(photo, path / 'face' / photo.name)
         face_label = face_name
     else:
         shutil.rmtree(path)
@@ -308,7 +342,7 @@ def make_preview(path: Path) -> None:
 
 def run_job(path: Path, data: dict) -> None:
     video = next((f for f in path.iterdir() if f.stem == 'input'), None)
-    face = next((f for f in path.iterdir() if f.stem == 'face'), None)
+    face = next((f for f in path.iterdir() if f.stem == 'face'), None)  # file or dir
     if not video or not face:
         data.update(status='failed', error='job folder is missing input files')
         write_job(path, data)
@@ -323,6 +357,10 @@ def run_job(path: Path, data: dict) -> None:
         command += ['--captions']
     for control, value in (data.get('edit') or {}).items():
         command += ['--edit', f'{control}={value}']
+    if data.get('swapper_model'):
+        command += ['--swapper-model', data['swapper_model']]
+    if data.get('enhancer_model'):
+        command += ['--enhancer-model', data['enhancer_model']]
     log = (path / 'swap.log').open('w')
     # own process group so a server restart can clean up the whole render tree
     process = subprocess.Popen(
@@ -364,6 +402,7 @@ def start_worker() -> None:
     JOBS.mkdir(exist_ok=True)
     FACES.mkdir(exist_ok=True)
     CLIPS.mkdir(exist_ok=True)
+    migrate_flat_faces()
     # a crashed worker leaves 'running' jobs behind — kill any orphaned render
     # (it has no supervisor left to record its result) and make them re-runnable
     for entry in JOBS.iterdir():

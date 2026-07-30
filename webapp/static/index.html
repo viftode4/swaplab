@@ -59,6 +59,9 @@
     width: 108px; height: 76px; border-radius: 6px;
   }
   .clips .face span { max-width: 112px; }
+  .faceinfo { color: var(--dim); font-size: 13px; padding: 2px 2px 6px;
+              display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .faceinfo .chip.mini { padding: 6px 11px; font-size: 12px; }
 
   .quality { display: flex; background: var(--panel); border-radius: 4px; padding: 4px; }
   .quality button {
@@ -141,6 +144,7 @@
 
 <div class="step"><b>1</b>whose face goes in</div>
 <div class="faces" id="faces"></div>
+<div class="faceinfo" id="faceInfo" hidden></div>
 
 <div class="step"><b>2</b>onto which clip</div>
 <div class="faces clips" id="clips"></div>
@@ -199,8 +203,8 @@
 <input type="file" id="audioInput" accept="audio/*,.m4a,.mp3,.wav,.ogg,.opus,.flac">
 
 <script>
-const state = { face: null, newFace: null, video: null, clip: null, quality: 'good',
-                audio: null, captions: false };
+const state = { face: null, pendingFaceName: null, video: null, clip: null,
+                quality: 'good', audio: null, captions: false };
 
 const $ = id => document.getElementById(id);
 
@@ -211,28 +215,45 @@ async function loadFaces() {
   for (const f of faces) {
     const b = document.createElement('button');
     b.className = 'face' + (state.face === f.name ? ' sel' : '');
-    b.innerHTML = `<img src="api/faces/${encodeURIComponent(f.file)}" alt=""><span>${f.name}</span>`;
+    b.innerHTML = `<img src="api/faces/${encodeURIComponent(f.name)}/thumb?v=${f.count}" alt="">
+                   <span>${f.name}${f.count > 1 ? ' · ' + f.count : ''}</span>`;
     b.onclick = () => { state.face = f.name; state.newFace = null; loadFaces(); ready(); };
     box.appendChild(b);
   }
   const add = document.createElement('button');
-  add.className = 'face' + (state.newFace ? ' sel' : '');
-  add.innerHTML = `<div class="blank">+</div><span>${state.newFace ? state.newFace.name : 'new face'}</span>`;
-  add.onclick = () => $('faceInput').click();
+  add.className = 'face';
+  add.innerHTML = `<div class="blank">+</div><span>new face</span>`;
+  add.onclick = () => { state.pendingFaceName = null; $('faceInput').click(); };
   box.appendChild(add);
+  const sel = faces.find(f => f.name === state.face);
+  $('faceInfo').hidden = !sel;
+  if (sel) {
+    $('faceInfo').innerHTML =
+      `${sel.count} photo${sel.count > 1 ? 's' : ''} of ${sel.name} — more angles = ` +
+      `stronger identity <button class="chip mini" id="addPhoto">+ photo</button> ` +
+      `<button class="chip mini" id="delFace">remove</button>`;
+    $('addPhoto').onclick = () => { state.pendingFaceName = sel.name; $('faceInput').click(); };
+    $('delFace').onclick = async () => {
+      if (!confirm(`remove ${sel.name} and all their photos?`)) return;
+      await fetch(`api/faces/${encodeURIComponent(sel.name)}`, { method: 'DELETE' });
+      state.face = null;
+      loadFaces(); ready();
+    };
+  }
 }
 
 $('faceInput').onchange = async e => {
   const file = e.target.files[0];
   if (!file) return;
-  const name = prompt('name this face (they said yes, right?)\nsame name = replaces old photo');
+  const name = state.pendingFaceName ||
+    prompt('name this face (they said yes, right?)\nsame name = adds another photo of them');
   if (!name) return;
   const fd = new FormData();
   fd.append('name', name);
   fd.append('photo', file);
   const saved = await fetch('api/faces', { method: 'POST', body: fd }).then(r => r.json());
   state.face = saved.name;
-  state.newFace = null;
+  e.target.value = '';
   loadFaces(); ready();
 };
 
@@ -331,10 +352,26 @@ $('go').onclick = async () => {
   const ed = edits();
   if (Object.keys(ed).length) fd.append('edit', JSON.stringify(ed));
   $('go').disabled = true;
-  $('go').textContent = state.video ? 'UPLOADING…' : 'QUEUEING…';
+  $('go').textContent = state.video ? 'UPLOADING 0%' : 'QUEUEING…';
   try {
-    const res = await fetch('api/jobs', { method: 'POST', body: fd });
-    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', 'api/jobs');
+      xhr.timeout = 0;
+      xhr.upload.onprogress = e => {
+        if (e.lengthComputable && state.video)
+          $('go').textContent = `UPLOADING ${Math.round(100 * e.loaded / e.total)}%`;
+      };
+      xhr.onload = () => {
+        if (xhr.status < 300) return resolve();
+        let detail = xhr.statusText;
+        try { detail = JSON.parse(xhr.responseText).detail || detail; } catch {}
+        reject(new Error(detail));
+      };
+      xhr.onerror = () => reject(new Error('connection dropped mid-upload — try again'));
+      xhr.ontimeout = () => reject(new Error('upload timed out'));
+      xhr.send(fd);
+    });
     state.video = null;
     state.audio = null;
     $('audioInput').value = '';

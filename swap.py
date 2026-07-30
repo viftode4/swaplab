@@ -77,7 +77,11 @@ QUALITY = {
     # fidelity stack: high-res swap, restore the original's expressions,
     # enhance at half blend so skin keeps the source footage's texture
     'best': (['face_swapper', 'expression_restorer', 'face_enhancer'], [
-        *OCCLUSION,
+        # region masking swaps only parsed face regions, so the hairline
+        # and anything above it stay untouched; softer mask edge to blend
+        '--face-mask-types', 'box', 'occlusion', 'region',
+        '--face-occluder-model', 'many',
+        '--face-mask-blur', '0.4',
         '--face-swapper-pixel-boost', '512x512',
         '--expression-restorer-factor', '90',
         '--face-enhancer-blend', '50',
@@ -85,6 +89,19 @@ QUALITY = {
         '--output-video-preset', 'slower',
     ]),
 }
+
+IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
+
+
+def face_photos(path: Path) -> list[Path]:
+    """A face is one photo or a directory of photos (averaged identity)."""
+    if path.is_dir():
+        photos = sorted(p for p in path.iterdir()
+                        if p.suffix.lower() in IMAGE_EXTS and not p.name.startswith('.'))
+        if not photos:
+            fail(f'no photos inside face directory {path}')
+        return photos
+    return [path]
 
 
 def fail(message: str) -> 'NoReturn':
@@ -190,7 +207,12 @@ def check_output_video(path: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--video', required=True, help='target video (the clip)')
-    parser.add_argument('--face', help='source face photo (a consented friend)')
+    parser.add_argument('--face', help='source face photo, or a directory of '
+                        'photos of the same person (averaged, stronger identity)')
+    parser.add_argument('--swapper-model', help='override face swapper model '
+                        '(e.g. hyperswap_1a_256, inswapper_128_fp16, ghost_3_256)')
+    parser.add_argument('--enhancer-model', help='override face enhancer model '
+                        '(e.g. gfpgan_1.4, codeformer)')
     parser.add_argument('--audio', help='voice/music track to lip-sync the face to')
     parser.add_argument('--captions', action='store_true',
                         help='transcribe speech locally and burn subtitles in')
@@ -213,7 +235,7 @@ def main() -> None:
     edits = parse_edits(args.edit, args.puppet)
     if face is None and audio is None and not edits:
         fail('nothing to do — pass --face, --audio and/or --edit')
-    if face is not None and not face.is_file():
+    if face is not None and not (face.is_file() or face.is_dir()):
         fail(f'face photo not found: {face}')
     if audio is not None and not audio.is_file():
         fail(f'audio track not found: {audio}')
@@ -232,7 +254,11 @@ def main() -> None:
     if face is None:
         processors, extra = [], []          # lip-sync only, no swap
     else:
-        sources.append(str(face))
+        sources.extend(str(p) for p in face_photos(face))
+    if args.swapper_model:
+        extra = [*extra, '--face-swapper-model', args.swapper_model]
+    if args.enhancer_model:
+        extra = [*extra, '--face-enhancer-model', args.enhancer_model]
     if edits:
         # edit before the syncer (sync owns the mouth) and the enhancer
         slot = processors.index('face_enhancer') if 'face_enhancer' in processors else len(processors)
