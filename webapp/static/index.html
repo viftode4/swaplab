@@ -63,7 +63,8 @@
   }
   .clips .face span { max-width: 112px; }
   .plainpick { color: var(--dim); font-size: 13px; padding: 6px 2px 2px; }
-  .plainpick input { display: block; margin-top: 8px; color: var(--ink); font-size: 14px; }
+  .plainpick input { display: block; margin: 8px 0 14px; color: var(--ink); font-size: 14px; }
+  .plainpick .hint { display: block; font-size: 12px; color: #6b6f77; margin: -6px 0 12px; }
   .faceinfo { color: var(--dim); font-size: 13px; padding: 2px 2px 6px;
               display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .faceinfo .chip.mini { padding: 6px 11px; font-size: 12px; }
@@ -164,8 +165,13 @@
 <div class="step"><b>2</b>onto which clip</div>
 <div class="faces clips" id="clips"></div>
 <div class="plainpick">
-  pick a video from your phone:
+  pick a video — from Photos:
   <input type="file" id="videoInput" accept="video/*">
+  <span class="hint">if tapping this does nothing, iOS is blocking Photos:
+    Settings → Apps → Safari → Photos → Allow. Or use the Files route below
+    (save the clip to Files first).</span>
+  from Files:
+  <input type="file" id="videoInputFiles">
 </div>
 
 <div class="step"><b>3</b>how fancy</div>
@@ -305,23 +311,35 @@ async function loadClips() {
   // native input itself — the only picker pattern iOS never breaks
   const add = document.createElement('div');
   add.className = 'face' + (state.video ? ' sel' : '');
+  // no accept filter: iOS routes video/* straight to Photos, which opens
+  // nothing at all when Safari lacks Photos permission
   add.innerHTML = `<div class="blank">+</div><span>${state.video ? state.video.name : 'new video'}</span>
-    <input class="overlay" type="file" accept="video/mp4,video/quicktime,video/webm,video/*">`;
+    <input class="overlay" type="file">`;
   add.querySelector('input').onchange = onVideoPicked;
   box.appendChild(add);
 }
 
+const VIDEO_EXTS = ['.mp4', '.mov', '.webm'];
+
 function onVideoPicked(e) {
-  state.video = e.target.files[0] || null;
-  if (state.video) state.clip = null;
+  const file = e.target.files[0] || null;
   const box = $('uplog');
   box.hidden = false; box.classList.remove('err');
+  if (file && !VIDEO_EXTS.some(x => file.name.toLowerCase().endsWith(x))) {
+    box.classList.add('err');
+    box.textContent = `${file.name} is not a video — pick an .mp4, .mov or .webm`;
+    e.target.value = '';
+    return;
+  }
+  state.video = file;
+  if (state.video) state.clip = null;
   box.textContent = state.video
     ? `ready: ${state.video.name} (${(state.video.size / 1e6).toFixed(1)}MB) — now tap SWAP IT`
     : 'no file selected';
   loadClips(); ready();
 }
 document.getElementById('videoInput').onchange = onVideoPicked;
+document.getElementById('videoInputFiles').onchange = onVideoPicked;
 
 $('voiceChip').onclick = e => {
   if (state.audio) {          // second tap clears instead of opening the picker
