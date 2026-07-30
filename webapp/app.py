@@ -11,9 +11,11 @@ job re-runnable. One worker thread = one CoreML job at a time.
 
 import argparse
 import json
+import os
 import re
 import secrets
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -311,8 +313,6 @@ def run_job(path: Path, data: dict) -> None:
         data.update(status='failed', error='job folder is missing input files')
         write_job(path, data)
         return
-    data.update(status='running', started=time.time(), error=None)
-    write_job(path, data)
     command = [str(PYTHON), str(SWAP),
                '--video', str(video), '--face', str(face),
                '--out', str(path / 'result.mp4'), '--quality', data['quality']]
@@ -324,10 +324,16 @@ def run_job(path: Path, data: dict) -> None:
     for control, value in (data.get('edit') or {}).items():
         command += ['--edit', f'{control}={value}']
     log = (path / 'swap.log').open('w')
-    result = subprocess.run(
-        command, stdout=log, stderr=subprocess.STDOUT, cwd=ROOT)
+    # own process group so a server restart can clean up the whole render tree
+    process = subprocess.Popen(
+        command, stdout=log, stderr=subprocess.STDOUT, cwd=ROOT,
+        start_new_session=True)
+    data.update(status='running', started=time.time(), error=None, pid=process.pid)
+    write_job(path, data)
+    returncode = process.wait()
     log.close()
-    if result.returncode == 0 and (path / 'result.mp4').is_file():
+    data['pid'] = None
+    if returncode == 0 and (path / 'result.mp4').is_file():
         make_preview(path)
         data.update(status='done', finished=time.time())
     else:
@@ -358,11 +364,17 @@ def start_worker() -> None:
     JOBS.mkdir(exist_ok=True)
     FACES.mkdir(exist_ok=True)
     CLIPS.mkdir(exist_ok=True)
-    # a crashed worker leaves 'running' jobs behind — make them re-runnable
+    # a crashed worker leaves 'running' jobs behind — kill any orphaned render
+    # (it has no supervisor left to record its result) and make them re-runnable
     for entry in JOBS.iterdir():
         data = read_job(entry)
         if data and data.get('status') == 'running':
-            data['status'] = 'queued'
+            if data.get('pid'):
+                try:
+                    os.killpg(os.getpgid(data['pid']), signal.SIGTERM)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+            data.update(status='queued', pid=None)
             write_job(entry, data)
     threading.Thread(target=worker, daemon=True).start()
 
