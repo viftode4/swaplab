@@ -4,8 +4,11 @@
 Usage:
     .venv/bin/python swap.py --video clip.mp4 --face vlad.jpg --out result.mp4
     .venv/bin/python swap.py ... --quality fast|good|best   (default: good)
+    .venv/bin/python swap.py ... --audio voice.m4a          (lip-sync to track)
+    .venv/bin/python swap.py ... --captions                 (burn auto-subtitles)
 
-Consented faces only. Label output as AI-generated when posting.
+--audio without --face lip-syncs the original face. Consented faces and
+voices only. Label output as AI-generated when posting.
 """
 
 import argparse
@@ -39,6 +42,88 @@ def fail(message: str) -> 'NoReturn':
     sys.exit(1)
 
 
+def video_size(path: Path) -> tuple[int, int]:
+    ffprobe = shutil.which('ffprobe')
+    probe = subprocess.run(
+        [ffprobe, '-v', 'error', '-select_streams', 'v:0',
+         '-show_entries', 'stream=width,height', '-of', 'csv=p=0', str(path)],
+        capture_output=True, text=True)
+    width, height = probe.stdout.strip().split(',')[:2]
+    return int(width), int(height)
+
+
+CAPTION_FONTS = [
+    '/System/Library/Fonts/Supplemental/Arial Black.ttf',
+    '/System/Library/Fonts/Supplemental/Impact.ttf',
+    '/System/Library/Fonts/Supplemental/Arial Bold.ttf',
+]
+
+
+def caption_card(text: str, width: int, height: int, dest: Path) -> None:
+    """Rasterize one caption as a transparent full-frame PNG (Pillow)."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    font_path = next((f for f in CAPTION_FONTS if Path(f).is_file()), None)
+    size = max(24, height // 14)
+    font = (ImageFont.truetype(font_path, size) if font_path
+            else ImageFont.load_default(size))
+    card = Image.new('RGBA', (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(card)
+    stroke = max(2, size // 10)
+    box = draw.textbbox((0, 0), text, font=font, stroke_width=stroke)
+    x = (width - (box[2] - box[0])) / 2 - box[0]
+    y = height * 0.78 - (box[3] - box[1]) / 2 - box[1]
+    draw.text((x, y), text, font=font, fill='white',
+              stroke_width=stroke, stroke_fill='black')
+    card.save(dest)
+
+
+def burn_captions(out: Path) -> None:
+    """Transcribe speech locally and burn big word-group subtitles in."""
+    from faster_whisper import WhisperModel
+
+    print('captions: transcribing (local whisper)…', flush=True)
+    model = WhisperModel('small', device='cpu', compute_type='int8')
+    segments, _ = model.transcribe(str(out), word_timestamps=True)
+    words = [word for segment in segments for word in segment.words or []]
+    if not words:
+        print('captions: no speech found, skipping')
+        return
+
+    # this ffmpeg build has no libass/drawtext — rasterize each caption as a
+    # transparent PNG and stack time-gated overlay filters instead
+    width, height = video_size(out)
+    cards = []  # (png path, start, end)
+    for i in range(0, len(words), 3):
+        group = words[i:i + 3]
+        text = ' '.join(w.word.strip() for w in group).upper().replace('\n', ' ')
+        png = out.with_name(f'.{out.stem}.cap{i}.png')
+        caption_card(text, width, height, png)
+        cards.append((png, group[0].start, group[-1].end))
+
+    ffmpeg = shutil.which('ffmpeg')
+    tmp = out.with_name(f'.{out.stem}.captioned{out.suffix}')
+    inputs, chain, current = [], [], '0:v'
+    for index, (png, start, end) in enumerate(cards):
+        inputs += ['-i', str(png)]
+        label = f'v{index}'
+        chain.append(f"[{current}][{index + 1}:v]overlay="
+                     f"enable='between(t,{start:.3f},{end:.3f})'[{label}]")
+        current = label
+    burn = subprocess.run(
+        [ffmpeg, '-y', '-v', 'error', '-i', str(out), *inputs,
+         '-filter_complex', ';'.join(chain), '-map', f'[{current}]',
+         '-map', '0:a?', '-c:v', 'libx264', '-preset', 'fast',
+         '-crf', '18', '-c:a', 'copy', str(tmp)],
+        capture_output=True, text=True)
+    for png, _, _ in cards:
+        png.unlink(missing_ok=True)
+    if burn.returncode != 0 or not tmp.is_file():
+        fail(f'caption burn failed:\n{burn.stderr.strip()}')
+    tmp.replace(out)
+    print(f'captions: burned {len(cards)} lines')
+
+
 def check_output_video(path: Path) -> None:
     """Verify the result is a playable video; fail loudly otherwise."""
     ffprobe = shutil.which('ffprobe')
@@ -55,20 +140,28 @@ def check_output_video(path: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--video', required=True, help='target video (the clip)')
-    parser.add_argument('--face', required=True, help='source face photo (a consented friend)')
+    parser.add_argument('--face', help='source face photo (a consented friend)')
+    parser.add_argument('--audio', help='voice/music track to lip-sync the face to')
+    parser.add_argument('--captions', action='store_true',
+                        help='transcribe speech locally and burn subtitles in')
     parser.add_argument('--out', required=True, help='output video path')
     parser.add_argument('--quality', choices=QUALITY, default='good')
     parser.add_argument('--cpu', action='store_true', help='force CPU (skip CoreML)')
     args = parser.parse_args()
 
     video = Path(args.video).expanduser().resolve()
-    face = Path(args.face).expanduser().resolve()
+    face = Path(args.face).expanduser().resolve() if args.face else None
+    audio = Path(args.audio).expanduser().resolve() if args.audio else None
     out = Path(args.out).expanduser().resolve()
 
     if not video.is_file():
         fail(f'video not found: {video}')
-    if not face.is_file():
+    if face is None and audio is None:
+        fail('nothing to do — pass --face and/or --audio')
+    if face is not None and not face.is_file():
         fail(f'face photo not found: {face}')
+    if audio is not None and not audio.is_file():
+        fail(f'audio track not found: {audio}')
     if not PYTHON.is_file():
         fail('venv missing — run the setup in README.md first')
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -80,9 +173,20 @@ def main() -> None:
         work_out = out.with_name(f'.{out.stem}.work{video.suffix.lower()}')
 
     processors, extra = QUALITY[args.quality]
+    sources = []
+    if face is None:
+        processors, extra = [], []          # lip-sync only, no swap
+    else:
+        sources.append(str(face))
+    if audio is not None:
+        # sync before the enhancer so the generated mouth gets polished too
+        slot = processors.index('face_enhancer') if 'face_enhancer' in processors else len(processors)
+        processors = [*processors[:slot], 'lip_syncer', *processors[slot:]]
+        sources.append(str(audio))
+
     command = [
         str(PYTHON), 'facefusion.py', 'headless-run',
-        '--source-paths', str(face),
+        '--source-paths', *sources,
         '--target-path', str(video),
         '--output-path', str(work_out),
         '--processors', *processors,
@@ -111,6 +215,9 @@ def main() -> None:
         work_out.unlink(missing_ok=True)
         if remux.returncode != 0 or not out.is_file():
             fail(f'could not convert output to {out.suffix}:\n{remux.stderr.strip()}')
+
+    if args.captions:
+        burn_captions(out)
     check_output_video(out)
     print(f'done: {out}')
 

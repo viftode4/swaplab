@@ -30,6 +30,8 @@ VIRTUAL_ENV=$PWD/.venv uv pip install -r facefusion/requirements.txt
 ```bash
 .venv/bin/python swap.py --video clip.mp4 --face vlad.jpg --out result.mp4
 # quality: --quality fast|good|best   (default good)
+# --audio voice.m4a   lip-sync the face to a track (works without --face too)
+# --captions          burn local-whisper auto-subtitles into the video
 ```
 
 Or the FaceFusion UI directly:

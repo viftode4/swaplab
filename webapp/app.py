@@ -34,6 +34,7 @@ INDEX = Path(__file__).resolve().parent / 'static' / 'index.html'
 
 VIDEO_EXTS = {'.mp4', '.mov', '.webm'}
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
+AUDIO_EXTS = {'.mp3', '.wav', '.m4a', '.ogg', '.opus', '.flac'}
 QUALITIES = {'fast', 'good', 'best'}
 
 app = FastAPI(title='SwapLab')
@@ -167,6 +168,8 @@ async def api_create_job(
     quality: str = Form('good'),
     face_name: str = Form(''),
     face_photo: UploadFile | None = File(None),
+    audio: UploadFile | None = File(None),
+    captions: bool = Form(False),
 ) -> dict:
     if quality not in QUALITIES:
         raise HTTPException(400, f'quality must be one of {sorted(QUALITIES)}')
@@ -211,12 +214,23 @@ async def api_create_job(
         shutil.rmtree(path)
         raise HTTPException(400, 'pick a face or upload a face photo')
 
+    audio_label = None
+    if audio is not None and audio.filename:
+        audio_ext = Path(audio.filename).suffix.lower()
+        if audio_ext not in AUDIO_EXTS:
+            shutil.rmtree(path)
+            raise HTTPException(400, f'audio must be one of {sorted(AUDIO_EXTS)}')
+        await save_upload(audio, path / f'audio{audio_ext}')
+        audio_label = audio.filename
+
     write_job(path, {
         'id': job_id,
         'status': 'queued',
         'quality': quality,
         'face': face_label,
         'video': video_label,
+        'audio': audio_label,
+        'captions': captions,
         'created': time.time(),
         'error': None,
     })
@@ -262,12 +276,17 @@ def run_job(path: Path, data: dict) -> None:
         return
     data.update(status='running', started=time.time(), error=None)
     write_job(path, data)
+    command = [str(PYTHON), str(SWAP),
+               '--video', str(video), '--face', str(face),
+               '--out', str(path / 'result.mp4'), '--quality', data['quality']]
+    audio = next((f for f in path.iterdir() if f.stem == 'audio'), None)
+    if audio:
+        command += ['--audio', str(audio)]
+    if data.get('captions'):
+        command += ['--captions']
     log = (path / 'swap.log').open('w')
     result = subprocess.run(
-        [str(PYTHON), str(SWAP),
-         '--video', str(video), '--face', str(face),
-         '--out', str(path / 'result.mp4'), '--quality', data['quality']],
-        stdout=log, stderr=subprocess.STDOUT, cwd=ROOT)
+        command, stdout=log, stderr=subprocess.STDOUT, cwd=ROOT)
     log.close()
     if result.returncode == 0 and (path / 'result.mp4').is_file():
         data.update(status='done', finished=time.time())

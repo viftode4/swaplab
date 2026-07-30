@@ -67,6 +67,15 @@
   }
   .quality button.sel { background: #23262d; color: var(--ink); }
 
+  .opt { text-transform: none; letter-spacing: 0; }
+  .extras { display: flex; gap: 10px; flex-wrap: wrap; }
+  .chip {
+    background: var(--panel); border: 1px solid #3a3e46; color: var(--dim);
+    border-radius: 999px; padding: 11px 18px; font-size: 14px; font-weight: 600;
+    max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .chip.sel { border-color: var(--go); color: var(--ink); }
+
   #go {
     width: 100%;
     margin-top: 30px;
@@ -130,6 +139,12 @@
   <button data-q="best">best</button>
 </div>
 
+<div class="step"><b>4</b>extras <span class="opt">(optional)</span></div>
+<div class="extras">
+  <button class="chip" id="voiceChip">🎤 add a voice</button>
+  <button class="chip" id="capChip">💬 captions</button>
+</div>
+
 <button id="go" disabled>SWAP IT</button>
 
 <div class="step">the lab queue</div>
@@ -137,9 +152,11 @@
 
 <input type="file" id="videoInput" accept="video/mp4,video/quicktime,video/webm,video/*">
 <input type="file" id="faceInput" accept="image/*">
+<input type="file" id="audioInput" accept="audio/*,.m4a,.mp3,.wav,.ogg,.opus,.flac">
 
 <script>
-const state = { face: null, newFace: null, video: null, clip: null, quality: 'good' };
+const state = { face: null, newFace: null, video: null, clip: null, quality: 'good',
+                audio: null, captions: false };
 
 const $ = id => document.getElementById(id);
 
@@ -201,6 +218,26 @@ $('videoInput').onchange = e => {
   loadClips(); ready();
 };
 
+$('voiceChip').onclick = () => {
+  if (state.audio) {
+    state.audio = null;
+    $('audioInput').value = '';
+    $('voiceChip').textContent = '🎤 add a voice';
+    $('voiceChip').classList.remove('sel');
+  } else {
+    $('audioInput').click();
+  }
+};
+$('audioInput').onchange = e => {
+  state.audio = e.target.files[0] || null;
+  $('voiceChip').textContent = state.audio ? `🎤 ${state.audio.name} ✕` : '🎤 add a voice';
+  $('voiceChip').classList.toggle('sel', !!state.audio);
+};
+$('capChip').onclick = () => {
+  state.captions = !state.captions;
+  $('capChip').classList.toggle('sel', state.captions);
+};
+
 $('quality').onclick = e => {
   const q = e.target.dataset.q;
   if (!q) return;
@@ -218,12 +255,18 @@ $('go').onclick = async () => {
   else fd.append('clip_name', state.clip);
   fd.append('quality', state.quality);
   fd.append('face_name', state.face);
+  if (state.audio) fd.append('audio', state.audio);
+  if (state.captions) fd.append('captions', 'true');
   $('go').disabled = true;
   $('go').textContent = state.video ? 'UPLOADING…' : 'QUEUEING…';
   try {
     const res = await fetch('api/jobs', { method: 'POST', body: fd });
     if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
     state.video = null;
+    state.audio = null;
+    $('audioInput').value = '';
+    $('voiceChip').textContent = '🎤 add a voice';
+    $('voiceChip').classList.remove('sel');
     loadClips();
   } catch (err) {
     alert('upload failed: ' + err.message);
@@ -252,9 +295,10 @@ async function poll() {
     const spin = (j.status === 'running' || j.status === 'queued') ? '<div class="spin"></div>' : '';
     const link = j.status === 'done'
       ? `<a href="api/jobs/${j.id}/result" download>save</a>` : '';
+    const extras = (j.audio ? ' · 🎤' : '') + (j.captions ? ' · 💬' : '');
     const sub = j.status === 'failed'
       ? `<div class="sub err">${j.error || 'failed'}</div>`
-      : `<div class="sub">${fmtAge(j)}</div>`;
+      : `<div class="sub">${fmtAge(j)}${extras}</div>`;
     div.innerHTML = `${spin}<div class="meta"><div class="name">${j.face} → ${j.video}</div>${sub}</div>${link}`;
     strip.appendChild(div);
   }
