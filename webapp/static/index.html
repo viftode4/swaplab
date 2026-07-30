@@ -218,17 +218,19 @@
 const state = { face: null, pendingFaceName: null, video: null, clip: null,
                 quality: 'good', audio: null, captions: false };
 
-// surface JS errors on the page — a phone has no console we can read
-window.onerror = (msg, src, line) => {
+// a phone has no console we can read: show failures and report them home
+function report(where, detail) {
   const box = document.getElementById('uplog');
   if (box) { box.hidden = false; box.classList.add('err');
-             box.textContent = `js error: ${msg} (line ${line})`; }
-};
-window.onunhandledrejection = e => {
-  const box = document.getElementById('uplog');
-  if (box) { box.hidden = false; box.classList.add('err');
-             box.textContent = 'js error: ' + (e.reason?.message || e.reason); }
-};
+             box.textContent = `${where}: ${detail}`; }
+  try {
+    navigator.sendBeacon('api/clienterror', new Blob(
+      [JSON.stringify({where, detail, ua: navigator.userAgent})],
+      {type: 'application/json'}));
+  } catch {}
+}
+window.onerror = (msg, src, line) => report('js error', `${msg} (line ${line})`);
+window.onunhandledrejection = e => report('js error', e.reason?.message || String(e.reason));
 
 const $ = id => document.getElementById(id);
 
@@ -349,7 +351,7 @@ function uploadClip(file) {
     if (xhr.status >= 300) {
       let detail = xhr.statusText;
       try { detail = JSON.parse(xhr.responseText).detail || detail; } catch {}
-      box.classList.add('err'); box.textContent = '✕ ' + detail;
+      report('upload failed', `${xhr.status} ${detail} (${file.name}, ${mb}MB)`);
       return;
     }
     const saved = JSON.parse(xhr.responseText);
@@ -358,8 +360,8 @@ function uploadClip(file) {
     box.textContent = `${saved.name} uploaded ✓ — pick a face and tap SWAP IT`;
     await loadClips(); ready();
   };
-  xhr.onerror = () => { box.classList.add('err');
-    box.textContent = '✕ connection dropped mid-upload — try again'; };
+  xhr.onerror = () => report('upload failed',
+    `connection dropped after ${xhr.upload._sent || '?'} (${file.name}, ${mb}MB)`);
   xhr.send(fd);
 }
 
@@ -458,9 +460,7 @@ $('go').onclick = async () => {
     $('voiceChip').classList.remove('sel');
     loadClips();
   } catch (err) {
-    $('uplog').hidden = false;
-    $('uplog').classList.add('err');
-    $('uplog').textContent = '✕ ' + err.message;
+    report('queueing failed', err.message);
   }
   $('go').textContent = 'SWAP IT';
   ready();

@@ -165,6 +165,13 @@ def api_faces() -> list[dict]:
     return list_faces()
 
 
+@app.post('/api/clienterror')
+async def api_client_error(report: dict) -> dict:
+    """Phone-side failures are invisible from here; log them."""
+    print(f'CLIENT-ERROR {json.dumps(report)[:800]}', flush=True)
+    return {'logged': True}
+
+
 def person_dir(name: str) -> Path:
     target = (FACES / name).resolve()
     if target.parent != FACES.resolve():
