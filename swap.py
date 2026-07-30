@@ -115,10 +115,11 @@ def fail(message: str) -> 'NoReturn':
     sys.exit(1)
 
 
-# phone screen recordings run 1290x2796 at 60fps; at that size the four-stage
-# best pipeline gets OOM-killed. 1080p30 is past what TikTok shows anyway.
+# phone screen recordings run 1290x2796; at that size the four-stage best
+# pipeline gets OOM-killed, and memory scales with frame area, not frame rate.
+# Frame rate is left alone: halving it to 30 made motion judder, which reads
+# as flicker and cost far more than the enhancer ever did.
 MAX_LONG_SIDE = 1920
-MAX_FPS = 30
 
 # Apple silicon has a dedicated encode engine: several times faster than
 # libx264 and it leaves the CPU free for the actual inference work
@@ -138,18 +139,14 @@ def video_stats(path: Path) -> tuple[int, int, float]:
 
 
 def normalize_target(video: Path, work_dir: Path) -> Path:
-    """Cap resolution and frame rate so big phone clips fit in memory."""
+    """Cap resolution so big phone clips fit in memory; keep the frame rate."""
     width, height, fps = video_stats(video)
-    if max(width, height) <= MAX_LONG_SIDE and fps <= MAX_FPS + 0.5:
+    if max(width, height) <= MAX_LONG_SIDE:
         return video
 
     scaled = work_dir / f'.{video.stem}.normalized{video.suffix.lower()}'
-    filters = []
-    if max(width, height) > MAX_LONG_SIDE:
-        filters.append(f'scale={MAX_LONG_SIDE}:{MAX_LONG_SIDE}'
-                       ':force_original_aspect_ratio=decrease:force_divisible_by=2')
-    if fps > MAX_FPS + 0.5:
-        filters.append(f'fps={MAX_FPS}')
+    filters = [f'scale={MAX_LONG_SIDE}:{MAX_LONG_SIDE}'
+               ':force_original_aspect_ratio=decrease:force_divisible_by=2']
     print(f'normalizing {width}x{height}@{fps:.0f} -> '
           f'{"/".join(filters)} (keeps the render inside memory)', flush=True)
     result = subprocess.run(
