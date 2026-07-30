@@ -21,6 +21,50 @@ ROOT = Path(__file__).resolve().parent
 FACEFUSION = ROOT / 'facefusion'
 PYTHON = ROOT / '.venv' / 'bin' / 'python'
 
+# face editor control -> facefusion flag suffix (all sliders run -1.0..1.0)
+EDIT_CONTROLS = {
+    'smile': 'mouth-smile',
+    'pout': 'mouth-pout',
+    'grim': 'mouth-grim',
+    'purse': 'mouth-purse',
+    'lips': 'lip-open-ratio',
+    'mouth-x': 'mouth-position-horizontal',
+    'mouth-y': 'mouth-position-vertical',
+    'eyes': 'eye-open-ratio',
+    'brows': 'eyebrow-direction',
+    'gaze-x': 'eye-gaze-horizontal',
+    'gaze-y': 'eye-gaze-vertical',
+    'pitch': 'head-pitch',
+    'yaw': 'head-yaw',
+    'roll': 'head-roll',
+}
+
+# named shorthands -> control values (usable from the CLI via --puppet)
+PUPPETS = {
+    'grin': {'smile': 1.0},
+    'shocked': {'eyes': 1.0, 'lips': 0.7, 'brows': 1.0},
+    'grumpy': {'grim': 0.7, 'smile': -0.6, 'brows': -1.0},
+    'side-eye': {'gaze-x': 1.0},
+    'sleepy': {'eyes': -0.7},
+    'pout': {'pout': 1.0},
+}
+
+
+def parse_edits(pairs: list[str] | None, puppet: str | None) -> dict[str, float]:
+    edits = dict(PUPPETS[puppet]) if puppet else {}
+    for pair in pairs or []:
+        control, _, raw = pair.partition('=')
+        if control not in EDIT_CONTROLS:
+            fail(f'unknown edit control {control!r} — pick from {", ".join(EDIT_CONTROLS)}')
+        try:
+            value = float(raw)
+        except ValueError:
+            fail(f'edit {control}: {raw!r} is not a number')
+        if not -1.0 <= value <= 1.0:
+            fail(f'edit {control}: {value} outside -1.0..1.0')
+        edits[control] = value
+    return edits
+
 # quality tier -> (processors, extra facefusion args)
 QUALITY = {
     'fast': (['face_swapper'], []),
@@ -144,6 +188,10 @@ def main() -> None:
     parser.add_argument('--audio', help='voice/music track to lip-sync the face to')
     parser.add_argument('--captions', action='store_true',
                         help='transcribe speech locally and burn subtitles in')
+    parser.add_argument('--edit', action='append', metavar='CONTROL=VALUE',
+                        help=f'face editor slider, -1.0..1.0 (repeatable): {", ".join(EDIT_CONTROLS)}')
+    parser.add_argument('--puppet', choices=PUPPETS,
+                        help='named shorthand that pre-fills --edit values')
     parser.add_argument('--out', required=True, help='output video path')
     parser.add_argument('--quality', choices=QUALITY, default='good')
     parser.add_argument('--cpu', action='store_true', help='force CPU (skip CoreML)')
@@ -156,8 +204,9 @@ def main() -> None:
 
     if not video.is_file():
         fail(f'video not found: {video}')
-    if face is None and audio is None:
-        fail('nothing to do — pass --face and/or --audio')
+    edits = parse_edits(args.edit, args.puppet)
+    if face is None and audio is None and not edits:
+        fail('nothing to do — pass --face, --audio and/or --edit')
     if face is not None and not face.is_file():
         fail(f'face photo not found: {face}')
     if audio is not None and not audio.is_file():
@@ -178,6 +227,12 @@ def main() -> None:
         processors, extra = [], []          # lip-sync only, no swap
     else:
         sources.append(str(face))
+    if edits:
+        # edit before the syncer (sync owns the mouth) and the enhancer
+        slot = processors.index('face_enhancer') if 'face_enhancer' in processors else len(processors)
+        processors = [*processors[:slot], 'face_editor', *processors[slot:]]
+        for control, value in edits.items():
+            extra = [*extra, f'--face-editor-{EDIT_CONTROLS[control]}', str(value)]
     if audio is not None:
         # sync before the enhancer so the generated mouth gets polished too
         slot = processors.index('face_enhancer') if 'face_enhancer' in processors else len(processors)
@@ -186,7 +241,7 @@ def main() -> None:
 
     command = [
         str(PYTHON), 'facefusion.py', 'headless-run',
-        '--source-paths', *sources,
+        *(['--source-paths', *sources] if sources else []),
         '--target-path', str(video),
         '--output-path', str(work_out),
         '--processors', *processors,

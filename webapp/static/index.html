@@ -75,6 +75,16 @@
     max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .chip.sel { border-color: var(--go); color: var(--ink); }
+  .chip.mini { padding: 8px 13px; font-size: 16px; }
+  #editor { background: var(--panel); border-radius: 6px; padding: 14px 16px 8px; margin-top: 10px; }
+  #editor .presets { margin-bottom: 4px; }
+  .sgroup { color: var(--dim); font-size: 11px; letter-spacing: .14em;
+            text-transform: uppercase; margin: 12px 0 2px; }
+  .srow { display: flex; align-items: center; gap: 12px; padding: 7px 0;
+          font-size: 14px; color: var(--dim); }
+  .srow input { flex: 1; accent-color: var(--go); min-width: 0; }
+  .srow b { width: 42px; text-align: right; color: var(--ink);
+            font-variant-numeric: tabular-nums; font-weight: 600; }
 
   #go {
     width: 100%;
@@ -143,6 +153,37 @@
 <div class="extras">
   <button class="chip" id="voiceChip">🎤 add a voice</button>
   <button class="chip" id="capChip">💬 captions</button>
+</div>
+<div class="extras" style="margin-top:10px">
+  <button class="chip" id="editChip">🎭 face editor</button>
+</div>
+<div id="editor" hidden>
+  <div class="extras presets">
+    <button class="chip mini" data-preset='{"smile":1}'>😁</button>
+    <button class="chip mini" data-preset='{"eyes":1,"lips":0.7,"brows":1}'>😱</button>
+    <button class="chip mini" data-preset='{"grim":0.7,"smile":-0.6,"brows":-1}'>😠</button>
+    <button class="chip mini" data-preset='{"gaze-x":1}'>👀</button>
+    <button class="chip mini" data-preset='{"eyes":-0.7}'>😴</button>
+    <button class="chip mini" data-preset='{"pout":1}'>😗</button>
+    <button class="chip mini" id="editReset">reset</button>
+  </div>
+  <div class="sgroup">mouth</div>
+  <label class="srow">smile<input type="range" data-c="smile" min="-1" max="1" step="0.05" value="0"><b>0</b></label>
+  <label class="srow">pout<input type="range" data-c="pout" min="-1" max="1" step="0.05" value="0"><b>0</b></label>
+  <label class="srow">grim<input type="range" data-c="grim" min="-1" max="1" step="0.05" value="0"><b>0</b></label>
+  <label class="srow">purse<input type="range" data-c="purse" min="-1" max="1" step="0.05" value="0"><b>0</b></label>
+  <label class="srow">lips open<input type="range" data-c="lips" min="-1" max="1" step="0.05" value="0"><b>0</b></label>
+  <label class="srow">mouth ↔<input type="range" data-c="mouth-x" min="-1" max="1" step="0.05" value="0"><b>0</b></label>
+  <label class="srow">mouth ↕<input type="range" data-c="mouth-y" min="-1" max="1" step="0.05" value="0"><b>0</b></label>
+  <div class="sgroup">eyes</div>
+  <label class="srow">eyes open<input type="range" data-c="eyes" min="-1" max="1" step="0.05" value="0"><b>0</b></label>
+  <label class="srow">brows<input type="range" data-c="brows" min="-1" max="1" step="0.05" value="0"><b>0</b></label>
+  <label class="srow">gaze ↔<input type="range" data-c="gaze-x" min="-1" max="1" step="0.05" value="0"><b>0</b></label>
+  <label class="srow">gaze ↕<input type="range" data-c="gaze-y" min="-1" max="1" step="0.05" value="0"><b>0</b></label>
+  <div class="sgroup">head</div>
+  <label class="srow">nod<input type="range" data-c="pitch" min="-1" max="1" step="0.05" value="0"><b>0</b></label>
+  <label class="srow">turn<input type="range" data-c="yaw" min="-1" max="1" step="0.05" value="0"><b>0</b></label>
+  <label class="srow">tilt<input type="range" data-c="roll" min="-1" max="1" step="0.05" value="0"><b>0</b></label>
 </div>
 
 <button id="go" disabled>SWAP IT</button>
@@ -237,6 +278,33 @@ $('capChip').onclick = () => {
   state.captions = !state.captions;
   $('capChip').classList.toggle('sel', state.captions);
 };
+const sliders = [...document.querySelectorAll('#editor input[type=range]')];
+
+function edits() {
+  const out = {};
+  for (const s of sliders) {
+    const v = parseFloat(s.value);
+    if (v) out[s.dataset.c] = v;
+  }
+  return out;
+}
+function paintEditor() {
+  for (const s of sliders) s.nextElementSibling.textContent = (+s.value).toFixed(2).replace(/\.?0+$/, '') || '0';
+  const n = Object.keys(edits()).length;
+  $('editChip').textContent = n ? `🎭 face editor · ${n}` : '🎭 face editor';
+  $('editChip').classList.toggle('sel', n > 0);
+}
+$('editChip').onclick = () => { $('editor').hidden = !$('editor').hidden; };
+document.querySelector('#editor').oninput = paintEditor;
+document.querySelector('#editor .presets').onclick = e => {
+  const preset = e.target.dataset.preset;
+  if (e.target.id === 'editReset') { for (const s of sliders) s.value = 0; }
+  else if (preset) {
+    const vals = JSON.parse(preset);
+    for (const s of sliders) s.value = vals[s.dataset.c] || 0;
+  } else return;
+  paintEditor();
+};
 
 $('quality').onclick = e => {
   const q = e.target.dataset.q;
@@ -257,6 +325,8 @@ $('go').onclick = async () => {
   fd.append('face_name', state.face);
   if (state.audio) fd.append('audio', state.audio);
   if (state.captions) fd.append('captions', 'true');
+  const ed = edits();
+  if (Object.keys(ed).length) fd.append('edit', JSON.stringify(ed));
   $('go').disabled = true;
   $('go').textContent = state.video ? 'UPLOADING…' : 'QUEUEING…';
   try {
@@ -295,7 +365,8 @@ async function poll() {
     const spin = (j.status === 'running' || j.status === 'queued') ? '<div class="spin"></div>' : '';
     const link = j.status === 'done'
       ? `<a href="api/jobs/${j.id}/result" download>save</a>` : '';
-    const extras = (j.audio ? ' · 🎤' : '') + (j.captions ? ' · 💬' : '');
+    const extras = (j.audio ? ' · 🎤' : '') + (j.captions ? ' · 💬' : '')
+                 + (j.edit ? ' · 🎭' + Object.keys(j.edit).length : '');
     const sub = j.status === 'failed'
       ? `<div class="sub err">${j.error || 'failed'}</div>`
       : `<div class="sub">${fmtAge(j)}${extras}</div>`;

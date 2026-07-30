@@ -36,6 +36,8 @@ VIDEO_EXTS = {'.mp4', '.mov', '.webm'}
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
 AUDIO_EXTS = {'.mp3', '.wav', '.m4a', '.ogg', '.opus', '.flac'}
 QUALITIES = {'fast', 'good', 'best'}
+EDIT_CONTROLS = {'smile', 'pout', 'grim', 'purse', 'lips', 'mouth-x', 'mouth-y',
+                 'eyes', 'brows', 'gaze-x', 'gaze-y', 'pitch', 'yaw', 'roll'}
 
 app = FastAPI(title='SwapLab')
 wake = threading.Event()
@@ -170,9 +172,19 @@ async def api_create_job(
     face_photo: UploadFile | None = File(None),
     audio: UploadFile | None = File(None),
     captions: bool = Form(False),
+    edit: str = Form(''),
 ) -> dict:
     if quality not in QUALITIES:
         raise HTTPException(400, f'quality must be one of {sorted(QUALITIES)}')
+    edits = {}
+    if edit:
+        try:
+            edits = {k: float(v) for k, v in json.loads(edit).items()}
+        except (ValueError, TypeError, AttributeError):
+            raise HTTPException(400, 'edit must be a JSON object of control: value')
+        bad = [k for k in edits if k not in EDIT_CONTROLS]
+        if bad or any(not -1.0 <= v <= 1.0 for v in edits.values()):
+            raise HTTPException(400, f'bad edit controls: {bad or "value outside -1..1"}')
 
     if video is not None and video.filename:
         video_ext = Path(video.filename).suffix.lower()
@@ -231,6 +243,7 @@ async def api_create_job(
         'video': video_label,
         'audio': audio_label,
         'captions': captions,
+        'edit': edits or None,
         'created': time.time(),
         'error': None,
     })
@@ -284,6 +297,8 @@ def run_job(path: Path, data: dict) -> None:
         command += ['--audio', str(audio)]
     if data.get('captions'):
         command += ['--captions']
+    for control, value in (data.get('edit') or {}).items():
+        command += ['--edit', f'{control}={value}']
     log = (path / 'swap.log').open('w')
     result = subprocess.run(
         command, stdout=log, stderr=subprocess.STDOUT, cwd=ROOT)
