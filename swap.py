@@ -66,26 +66,25 @@ def parse_edits(pairs: list[str] | None, puppet: str | None) -> dict[str, float]
         edits[control] = value
     return edits
 
-# occlusion masking keeps hair/hands/props in front of the face on top of
-# the swap instead of being painted over (xseg segmenter, per-frame cost)
-# xseg_1 specifically: the 'many' ensemble includes xseg_2, which produces an
-# empty mask here and silently erases the whole swap (verified frame by frame)
-OCCLUSION = ['--face-mask-types', 'box', 'occlusion',
-             '--face-occluder-model', 'xseg_1']
+# no xseg occlusion masking in any tier: xseg_2 erases the whole swap, and
+# xseg_1 reads an open, motion-blurred mouth as an "occluder" and erases the
+# swap around it — the decision flips frame to frame, so the face oscillates
+# between swapped and original (verified on single frames: same stack with
+# occlusion off swaps cleanly). Region masking below covers the hairline and
+# most objects held in front of the face, without that failure mode.
 
 # quality tier -> (processors, extra facefusion args)
 QUALITY = {
     'fast': (['face_swapper'], []),
     'good': (['face_swapper', 'face_enhancer'],
-             [*OCCLUSION, '--face-enhancer-blend', '25']),
+             ['--face-enhancer-blend', '25']),
     # fidelity stack: high-res swap, restore the original's expressions,
     # enhance at half blend so skin keeps the source footage's texture
     'best': (['face_swapper', 'expression_restorer', 'face_enhancer'], [
         '--output-video-encoder', 'h264_videotoolbox',
         # region masking swaps only parsed face regions, so the hairline
         # and anything above it stay untouched; softer mask edge to blend
-        '--face-mask-types', 'box', 'occlusion', 'region',
-        '--face-occluder-model', 'xseg_1',
+        '--face-mask-types', 'box', 'region',
         '--face-mask-blur', '0.4',
         '--face-swapper-pixel-boost', '512x512',
         '--expression-restorer-factor', '90',
