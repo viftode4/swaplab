@@ -103,6 +103,19 @@ async def save_upload(upload: UploadFile, dest: Path) -> None:
             handle.write(chunk)
 
 
+def normalize_photo(path: Path) -> None:
+    """Bake EXIF rotation into the pixels. Browsers honor the tag but the
+    face detector reads raw pixels — a sideways face detects as no face."""
+    from PIL import Image, ImageOps
+    try:
+        img = Image.open(path)
+        fixed = ImageOps.exif_transpose(img)
+        if fixed is not img:
+            fixed.save(path, quality=95)
+    except OSError:
+        pass
+
+
 def list_clips() -> list[dict]:
     clips = []
     if CLIPS.is_dir():
@@ -173,7 +186,9 @@ async def api_add_face(name: str = Form(...), photo: UploadFile = File(...)) -> 
     person = FACES / slug(name)
     person.mkdir(parents=True, exist_ok=True)
     count = len(person_photos(person))
-    await save_upload(photo, person / f'photo-{count + 1}{ext}')
+    dest = person / f'photo-{count + 1}{ext}'
+    await save_upload(photo, dest)
+    normalize_photo(dest)
     return {'name': person.name, 'count': count + 1}
 
 
@@ -249,6 +264,7 @@ async def api_create_job(
             shutil.rmtree(path)
             raise HTTPException(400, f'face photo must be one of {sorted(IMAGE_EXTS)}')
         await save_upload(face_photo, path / f'face{face_ext}')
+        normalize_photo(path / f'face{face_ext}')
         face_label = 'uploaded photo'
     elif face_name:
         person = FACES / face_name
