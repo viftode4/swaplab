@@ -68,12 +68,18 @@ def main() -> None:
         fail('venv missing — run the setup in README.md first')
     out.parent.mkdir(parents=True, exist_ok=True)
 
+    # facefusion insists the output extension match the target's; swap into a
+    # sibling temp file with the right extension, remux to the asked-for name
+    work_out = out
+    if out.suffix.lower() != video.suffix.lower():
+        work_out = out.with_name(f'.{out.stem}.work{video.suffix.lower()}')
+
     processors, extra = QUALITY[args.quality]
     command = [
         str(PYTHON), 'facefusion.py', 'headless-run',
         '--source-paths', str(face),
         '--target-path', str(video),
-        '--output-path', str(out),
+        '--output-path', str(work_out),
         '--processors', *processors,
         '--execution-providers', 'cpu' if args.cpu else 'coreml',
         # keep the swap on one person: match the reference face across frames
@@ -84,8 +90,22 @@ def main() -> None:
     if result.returncode != 0:
         fail(f'facefusion exited with {result.returncode} '
              '(no face in photo/video and codec issues are the usual causes)')
-    if not out.is_file():
+    if not work_out.is_file():
         fail('facefusion reported success but produced no output file')
+
+    if work_out != out:
+        ffmpeg = shutil.which('ffmpeg') or fail('ffmpeg is required to remux output')
+        remux = subprocess.run(
+            [ffmpeg, '-y', '-v', 'error', '-i', str(work_out), '-c', 'copy', str(out)],
+            capture_output=True, text=True)
+        if remux.returncode != 0:  # container mismatch — re-encode instead
+            remux = subprocess.run(
+                [ffmpeg, '-y', '-v', 'error', '-i', str(work_out),
+                 '-c:v', 'libx264', '-preset', 'fast', '-crf', '18', '-c:a', 'aac', str(out)],
+                capture_output=True, text=True)
+        work_out.unlink(missing_ok=True)
+        if remux.returncode != 0 or not out.is_file():
+            fail(f'could not convert output to {out.suffix}:\n{remux.stderr.strip()}')
     check_output_video(out)
     print(f'done: {out}')
 
