@@ -19,3 +19,6 @@ jobs/
 # models
 *.onnx
 .assets/
+
+# omc state
+.omc/
