@@ -62,9 +62,7 @@
     width: 108px; height: 76px; border-radius: 6px;
   }
   .clips .face span { max-width: 112px; }
-  .plainpick { color: var(--dim); font-size: 13px; padding: 6px 2px 2px; }
-  .plainpick input { display: block; margin: 8px 0 14px; color: var(--ink); font-size: 14px; }
-  .plainpick .hint { display: block; font-size: 12px; color: #6b6f77; margin: -6px 0 12px; }
+  .pickwrap { position: relative; display: inline-block; }
   .faceinfo { color: var(--dim); font-size: 13px; padding: 2px 2px 6px;
               display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .faceinfo .chip.mini { padding: 6px 11px; font-size: 12px; }
@@ -159,20 +157,9 @@
 <div class="step"><b>1</b>whose face goes in</div>
 <div class="faces" id="faces"></div>
 <div class="faceinfo" id="faceInfo" hidden></div>
-<div class="plainpick">
-  <input type="file" id="faceInput" accept="image/*">
-  <span class="hint">adds a photo — new name creates a person, existing name
-    adds another angle to them.</span>
-</div>
 
 <div class="step"><b>2</b>onto which clip</div>
 <div class="faces clips" id="clips"></div>
-<div class="plainpick">
-  <input type="file" id="videoInput" accept="video/*,image/*">
-  <span class="hint">tap "+ new video" above or this button — both open the
-    iOS chooser (Photo Library · Take Video · Choose File). Clips saved into
-    iCloud Drive → SwapLab → inbox also appear automatically.</span>
-</div>
 
 <div class="step"><b>3</b>how fancy</div>
 <div class="quality" id="quality">
@@ -257,20 +244,23 @@ async function loadFaces() {
     b.onclick = () => { state.face = f.name; state.newFace = null; loadFaces(); ready(); };
     box.appendChild(b);
   }
-  const add = document.createElement('label');
-  add.htmlFor = 'faceInput';
+  const add = document.createElement('div');
   add.className = 'face';
-  add.innerHTML = `<div class="blank">+</div><span>new face</span>`;
-  add.onclick = () => { state.pendingFaceName = null; };
+  add.innerHTML = `<div class="blank">+</div><span>new face</span>
+    <input class="overlay" type="file" accept="image/*">`;
+  add.querySelector('input').onchange = e => { state.pendingFaceName = null; onFacePicked(e); };
   box.appendChild(add);
   const sel = faces.find(f => f.name === state.face);
   $('faceInfo').hidden = !sel;
   if (sel) {
     $('faceInfo').innerHTML =
       `${sel.count} photo${sel.count > 1 ? 's' : ''} of ${sel.name} — more angles = ` +
-      `stronger identity <label class="chip mini" for="faceInput" id="addPhoto">+ photo</label> ` +
+      `stronger identity <span class="chip mini pickwrap">+ photo` +
+      `<input class="overlay" type="file" accept="image/*"></span> ` +
       `<button class="chip mini" id="delFace">remove</button>`;
-    $('addPhoto').onclick = () => { state.pendingFaceName = sel.name; };
+    $('faceInfo').querySelector('.pickwrap input').onchange = e => {
+      state.pendingFaceName = sel.name; onFacePicked(e);
+    };
     $('delFace').onclick = async () => {
       if (!confirm(`remove ${sel.name} and all their photos?`)) return;
       await fetch(`api/faces/${encodeURIComponent(sel.name)}`, { method: 'DELETE' });
@@ -280,12 +270,12 @@ async function loadFaces() {
   }
 }
 
-$('faceInput').onchange = async e => {
+async function onFacePicked(e) {
   const file = e.target.files[0];
   if (!file) return;
   const name = state.pendingFaceName ||
     prompt('name this face (they said yes, right?)\nsame name = adds another photo of them');
-  if (!name) return;
+  if (!name) { e.target.value = ''; return; }
   const fd = new FormData();
   fd.append('name', name);
   fd.append('photo', file);
@@ -293,7 +283,7 @@ $('faceInput').onchange = async e => {
   state.face = saved.name;
   e.target.value = '';
   loadFaces(); ready();
-};
+}
 
 async function loadClips() {
   const clips = await fetch('api/clips').then(r => r.json());
@@ -325,21 +315,53 @@ const VIDEO_EXTS = ['.mp4', '.mov', '.webm'];
 function onVideoPicked(e) {
   const file = e.target.files[0] || null;
   const box = $('uplog');
-  box.hidden = false; box.classList.remove('err');
-  if (file && !VIDEO_EXTS.some(x => file.name.toLowerCase().endsWith(x))) {
-    box.classList.add('err');
+  if (!file) return;
+  if (!VIDEO_EXTS.some(x => file.name.toLowerCase().endsWith(x))) {
+    box.hidden = false; box.classList.add('err');
     box.textContent = `${file.name} is not a video — pick an .mp4, .mov or .webm`;
     e.target.value = '';
     return;
   }
-  state.video = file;
-  if (state.video) state.clip = null;
-  box.textContent = state.video
-    ? `ready: ${state.video.name} (${(state.video.size / 1e6).toFixed(1)}MB) — now tap SWAP IT`
-    : 'no file selected';
-  loadClips(); ready();
+  e.target.value = '';
+  uploadClip(file);
 }
-document.getElementById('videoInput').onchange = onVideoPicked;
+
+// upload straight into the library so progress is visible immediately and
+// the clip is reusable; SWAP IT then only has to queue
+function uploadClip(file) {
+  const box = $('uplog');
+  const mb = (file.size / 1e6).toFixed(1);
+  box.hidden = false; box.classList.remove('err');
+  box.innerHTML = `sending ${file.name} · 0 of ${mb}MB<div class="bar"><i style="width:0"></i></div>`;
+  const fill = box.querySelector('i');
+
+  const fd = new FormData();
+  fd.append('video', file);
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', 'api/clips');
+  xhr.upload.onprogress = ev => {
+    if (!ev.lengthComputable) return;
+    const pct = Math.round(100 * ev.loaded / ev.total);
+    box.firstChild.textContent = `sending ${file.name} · ${(ev.loaded / 1e6).toFixed(1)} of ${mb}MB (${pct}%)`;
+    fill.style.width = pct + '%';
+  };
+  xhr.onload = async () => {
+    if (xhr.status >= 300) {
+      let detail = xhr.statusText;
+      try { detail = JSON.parse(xhr.responseText).detail || detail; } catch {}
+      box.classList.add('err'); box.textContent = '✕ ' + detail;
+      return;
+    }
+    const saved = JSON.parse(xhr.responseText);
+    state.clip = saved.name;
+    state.video = null;
+    box.textContent = `${saved.name} uploaded ✓ — pick a face and tap SWAP IT`;
+    await loadClips(); ready();
+  };
+  xhr.onerror = () => { box.classList.add('err');
+    box.textContent = '✕ connection dropped mid-upload — try again'; };
+  xhr.send(fd);
+}
 
 $('voiceChip').onclick = e => {
   if (state.audio) {          // second tap clears instead of opening the picker
@@ -409,29 +431,24 @@ $('go').onclick = async () => {
   const ed = edits();
   if (Object.keys(ed).length) fd.append('edit', JSON.stringify(ed));
   $('go').disabled = true;
-  $('go').textContent = state.video ? 'UPLOADING 0%' : 'QUEUEING…';
+  $('go').textContent = 'QUEUEING…';
   const log = m => { $('uplog').hidden = false; $('uplog').classList.remove('err'); $('uplog').textContent = m; };
-  log(state.video ? `starting upload: ${state.video.name} (${(state.video.size / 1e6).toFixed(1)}MB)` : 'queueing…');
   try {
     await new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open('POST', 'api/jobs');
       xhr.timeout = 0;
       xhr.upload.onprogress = e => {
-        if (e.lengthComputable && state.video) {
-          const pct = Math.round(100 * e.loaded / e.total);
-          $('go').textContent = `UPLOADING ${pct}%`;
-          log(`uploading ${pct}% — ${(e.loaded / 1e6).toFixed(1)} of ${(e.total / 1e6).toFixed(1)}MB`);
-        }
+        if (e.lengthComputable && state.audio)
+          log(`sending voice track ${Math.round(100 * e.loaded / e.total)}%`);
       };
       xhr.onload = () => {
-        if (xhr.status < 300) { log('upload complete — queued ✓'); return resolve(); }
+        if (xhr.status < 300) { log('queued ✓ — watch the lab queue below'); return resolve(); }
         let detail = xhr.statusText;
         try { detail = JSON.parse(xhr.responseText).detail || detail; } catch {}
         reject(new Error(`server said ${xhr.status}: ${detail}`));
       };
-      xhr.onerror = () => reject(new Error('connection dropped mid-upload — try again'));
-      xhr.ontimeout = () => reject(new Error('upload timed out'));
+      xhr.onerror = () => reject(new Error('connection dropped — try again'));
       xhr.send(fd);
     });
     state.video = null;

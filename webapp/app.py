@@ -209,6 +209,15 @@ def api_clips() -> list[dict]:
     return list_clips()
 
 
+@app.post('/api/clips')
+async def api_add_clip(video: UploadFile = File(...)) -> dict:
+    ext = Path(video.filename or '').suffix.lower()
+    if ext not in VIDEO_EXTS:
+        raise HTTPException(400, f'video must be one of {sorted(VIDEO_EXTS)}')
+    clip = await store_clip(video)
+    return {'name': clip.stem, 'file': clip.name}
+
+
 @app.get('/api/clips/{file_name}/thumb')
 def api_clip_thumb(file_name: str) -> FileResponse:
     thumb = (THUMBS / f'{Path(file_name).stem}.jpg').resolve()
