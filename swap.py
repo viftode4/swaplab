@@ -65,13 +65,19 @@ def parse_edits(pairs: list[str] | None, puppet: str | None) -> dict[str, float]
         edits[control] = value
     return edits
 
+# occlusion masking keeps hair/hands/props in front of the face on top of
+# the swap instead of being painted over (xseg segmenter, per-frame cost)
+OCCLUSION = ['--face-mask-types', 'box', 'occlusion',
+             '--face-occluder-model', 'many']
+
 # quality tier -> (processors, extra facefusion args)
 QUALITY = {
     'fast': (['face_swapper'], []),
-    'good': (['face_swapper', 'face_enhancer'], []),
+    'good': (['face_swapper', 'face_enhancer'], [*OCCLUSION]),
     # fidelity stack: high-res swap, restore the original's expressions,
     # enhance at half blend so skin keeps the source footage's texture
     'best': (['face_swapper', 'expression_restorer', 'face_enhancer'], [
+        *OCCLUSION,
         '--face-swapper-pixel-boost', '512x512',
         '--expression-restorer-factor', '90',
         '--face-enhancer-blend', '50',
