@@ -139,7 +139,9 @@ async def store_clip(video: UploadFile) -> Path:
 
 @app.get('/')
 def index() -> FileResponse:
-    return FileResponse(INDEX, media_type='text/html')
+    # phones cache aggressively; the page is tiny, always revalidate
+    return FileResponse(INDEX, media_type='text/html',
+                        headers={'Cache-Control': 'no-cache, must-revalidate'})
 
 
 @app.get('/api/faces')
