@@ -60,8 +60,10 @@ CoreML execution provider.
 
 - Wraps FaceFusion headless mode; owns TikTok-tuned defaults (H.264, audio
   passthrough, vertical-friendly output).
-- `fast` = swap only; `good` = swap + restore on frames where the face is
-  large; `best` = restore everything.
+- `fast` = swap only; `good` = swap + restore; `best` = swap + restore with
+  higher encode quality/slower preset. (Conditional "restore only large
+  faces" is not native to FaceFusion — if `good` proves too slow it becomes a
+  Phase 3 custom processor.)
 - This CLI is the stable interface: the webapp and future automation call it
   (or the same underlying function), never FaceFusion directly.
 
