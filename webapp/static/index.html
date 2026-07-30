@@ -62,6 +62,8 @@
     width: 108px; height: 76px; border-radius: 6px;
   }
   .clips .face span { max-width: 112px; }
+  .plainpick { color: var(--dim); font-size: 13px; padding: 6px 2px 2px; }
+  .plainpick input { display: block; margin-top: 8px; color: var(--ink); font-size: 14px; }
   .faceinfo { color: var(--dim); font-size: 13px; padding: 2px 2px 6px;
               display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .faceinfo .chip.mini { padding: 6px 11px; font-size: 12px; }
@@ -154,9 +156,17 @@
 <div class="step"><b>1</b>whose face goes in</div>
 <div class="faces" id="faces"></div>
 <div class="faceinfo" id="faceInfo" hidden></div>
+<div class="plainpick">
+  or add a photo of someone new:
+  <input type="file" id="faceInput" accept="image/*">
+</div>
 
 <div class="step"><b>2</b>onto which clip</div>
 <div class="faces clips" id="clips"></div>
+<div class="plainpick">
+  pick a video from your phone:
+  <input type="file" id="videoInput" accept="video/*">
+</div>
 
 <div class="step"><b>3</b>how fancy</div>
 <div class="quality" id="quality">
@@ -208,12 +218,23 @@
 <div class="step">the lab queue</div>
 <div class="strip" id="strip"><div class="empty">nothing cooking yet</div></div>
 
-<input type="file" id="faceInput" accept="image/*">
 <input type="file" id="audioInput" accept="audio/*,.m4a,.mp3,.wav,.ogg,.opus,.flac">
 
 <script>
 const state = { face: null, pendingFaceName: null, video: null, clip: null,
                 quality: 'good', audio: null, captions: false };
+
+// surface JS errors on the page — a phone has no console we can read
+window.onerror = (msg, src, line) => {
+  const box = document.getElementById('uplog');
+  if (box) { box.hidden = false; box.classList.add('err');
+             box.textContent = `js error: ${msg} (line ${line})`; }
+};
+window.onunhandledrejection = e => {
+  const box = document.getElementById('uplog');
+  if (box) { box.hidden = false; box.classList.add('err');
+             box.textContent = 'js error: ' + (e.reason?.message || e.reason); }
+};
 
 const $ = id => document.getElementById(id);
 
@@ -293,8 +314,14 @@ async function loadClips() {
 function onVideoPicked(e) {
   state.video = e.target.files[0] || null;
   if (state.video) state.clip = null;
+  const box = $('uplog');
+  box.hidden = false; box.classList.remove('err');
+  box.textContent = state.video
+    ? `ready: ${state.video.name} (${(state.video.size / 1e6).toFixed(1)}MB) — now tap SWAP IT`
+    : 'no file selected';
   loadClips(); ready();
 }
+document.getElementById('videoInput').onchange = onVideoPicked;
 
 $('voiceChip').onclick = e => {
   if (state.audio) {          // second tap clears instead of opening the picker
