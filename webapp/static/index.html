@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SwapLab</title>
+<style>
+  :root {
+    --bg: #0c0d10;
+    --panel: #16181d;
+    --ink: #f2f3f0;
+    --dim: #7d8188;
+    --go: #c8ff2e;
+    --bad: #ff5d5d;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font: 16px/1.45 -apple-system, "SF Pro Text", "Helvetica Neue", sans-serif;
+    padding: max(14px, env(safe-area-inset-top)) 16px 48px;
+    max-width: 480px;
+    margin-inline: auto;
+  }
+  h1 {
+    font-size: clamp(52px, 19vw, 84px);
+    line-height: .88;
+    letter-spacing: -.045em;
+    font-weight: 800;
+    margin: 18px 0 2px -3px;
+  }
+  h1 em { font-style: normal; color: var(--go); }
+  .tagline { color: var(--dim); font-size: 13px; margin-bottom: 26px; }
+  .step {
+    color: var(--dim);
+    font-size: 11px;
+    letter-spacing: .18em;
+    text-transform: uppercase;
+    margin: 26px 0 10px;
+  }
+  .step b { color: var(--go); font-weight: 700; margin-right: 6px; }
+
+  .faces { display: flex; gap: 12px; overflow-x: auto; padding: 4px 2px 10px; }
+  .face { flex: 0 0 auto; text-align: center; background: none; border: 0; color: var(--dim); }
+  .face img, .face .blank {
+    width: 76px; height: 76px; border-radius: 50%;
+    object-fit: cover; display: block;
+    border: 3px solid transparent;
+  }
+  .face.sel img { border-color: var(--go); }
+  .face.sel { color: var(--ink); }
+  .face span { font-size: 12px; display: block; margin-top: 5px; max-width: 80px;
+               overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .face .blank {
+    border: 2px dashed #3a3e46; color: var(--dim);
+    display: grid; place-items: center; font-size: 30px; font-weight: 300;
+  }
+
+  .drop {
+    width: 100%;
+    background: var(--panel);
+    border: 2px dashed #3a3e46;
+    border-radius: 4px;
+    color: var(--dim);
+    padding: 26px 16px;
+    font-size: 15px;
+    text-align: center;
+  }
+  .drop.has { border-style: solid; border-color: var(--go); color: var(--ink); }
+
+  .quality { display: flex; background: var(--panel); border-radius: 4px; padding: 4px; }
+  .quality button {
+    flex: 1; border: 0; background: none; color: var(--dim);
+    padding: 12px 0; font-size: 14px; font-weight: 600; border-radius: 3px;
+  }
+  .quality button.sel { background: #23262d; color: var(--ink); }
+
+  #go {
+    width: 100%;
+    margin-top: 30px;
+    background: var(--go);
+    color: #101203;
+    border: 0;
+    border-radius: 6px;
+    font-size: 26px;
+    font-weight: 800;
+    letter-spacing: -.02em;
+    padding: 20px 0 22px;
+  }
+  #go:disabled { opacity: .35; }
+  #go:active { transform: translateY(1px); }
+
+  .strip { margin-top: 10px; }
+  .job {
+    display: flex; align-items: center; gap: 12px;
+    background: var(--panel);
+    border-left: 3px solid #3a3e46;
+    padding: 12px 14px;
+    margin-bottom: 8px;
+    font-size: 14px;
+  }
+  .job.done { border-left-color: var(--go); }
+  .job.failed { border-left-color: var(--bad); }
+  .job .meta { flex: 1; min-width: 0; }
+  .job .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .job .sub { color: var(--dim); font-size: 12px; }
+  .job .sub.err { color: var(--bad); }
+  .job a {
+    color: #101203; background: var(--go); text-decoration: none;
+    font-weight: 700; font-size: 13px; padding: 9px 14px; border-radius: 4px;
+    flex-shrink: 0;
+  }
+  .spin {
+    width: 16px; height: 16px; flex-shrink: 0;
+    border: 2px solid #3a3e46; border-top-color: var(--go);
+    border-radius: 50%; animation: r 0.9s linear infinite;
+  }
+  @keyframes r { to { transform: rotate(360deg); } }
+  .empty { color: var(--dim); font-size: 13px; padding: 6px 2px; }
+  input[type=file] { display: none; }
+</style>
+</head>
+<body>
+
+<h1>SWAP<em>LAB</em></h1>
+<p class="tagline">consented faces only · label it AI when you post</p>
+
+<div class="step"><b>1</b>whose face goes in</div>
+<div class="faces" id="faces"></div>
+
+<div class="step"><b>2</b>onto which clip</div>
+<button class="drop" id="drop">tap to pick a video</button>
+
+<div class="step"><b>3</b>how fancy</div>
+<div class="quality" id="quality">
+  <button data-q="fast">fast</button>
+  <button data-q="good" class="sel">good</button>
+  <button data-q="best">best</button>
+</div>
+
+<button id="go" disabled>SWAP IT</button>
+
+<div class="step">the lab queue</div>
+<div class="strip" id="strip"><div class="empty">nothing cooking yet</div></div>
+
+<input type="file" id="videoInput" accept="video/mp4,video/quicktime,video/webm,video/*">
+<input type="file" id="faceInput" accept="image/*">
+
+<script>
+const state = { face: null, newFace: null, video: null, quality: 'good' };
+
+const $ = id => document.getElementById(id);
+
+async function loadFaces() {
+  const faces = await fetch('api/faces').then(r => r.json());
+  const box = $('faces');
+  box.innerHTML = '';
+  for (const f of faces) {
+    const b = document.createElement('button');
+    b.className = 'face' + (state.face === f.name ? ' sel' : '');
+    b.innerHTML = `<img src="api/faces/${encodeURIComponent(f.file)}" alt=""><span>${f.name}</span>`;
+    b.onclick = () => { state.face = f.name; state.newFace = null; loadFaces(); ready(); };
+    box.appendChild(b);
+  }
+  const add = document.createElement('button');
+  add.className = 'face' + (state.newFace ? ' sel' : '');
+  add.innerHTML = `<div class="blank">+</div><span>${state.newFace ? state.newFace.name : 'new face'}</span>`;
+  add.onclick = () => $('faceInput').click();
+  box.appendChild(add);
+}
+
+$('faceInput').onchange = async e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const name = prompt('name this face (they said yes, right?)');
+  if (!name) return;
+  const fd = new FormData();
+  fd.append('name', name);
+  fd.append('photo', file);
+  const saved = await fetch('api/faces', { method: 'POST', body: fd }).then(r => r.json());
+  state.face = saved.name;
+  state.newFace = null;
+  loadFaces(); ready();
+};
+
+$('drop').onclick = () => $('videoInput').click();
+$('videoInput').onchange = e => {
+  state.video = e.target.files[0] || null;
+  $('drop').textContent = state.video ? state.video.name : 'tap to pick a video';
+  $('drop').classList.toggle('has', !!state.video);
+  ready();
+};
+
+$('quality').onclick = e => {
+  const q = e.target.dataset.q;
+  if (!q) return;
+  state.quality = q;
+  for (const b of $('quality').children) b.classList.toggle('sel', b.dataset.q === q);
+};
+
+function ready() {
+  $('go').disabled = !(state.video && state.face);
+}
+
+$('go').onclick = async () => {
+  const fd = new FormData();
+  fd.append('video', state.video);
+  fd.append('quality', state.quality);
+  fd.append('face_name', state.face);
+  $('go').disabled = true;
+  $('go').textContent = 'UPLOADING…';
+  try {
+    const res = await fetch('api/jobs', { method: 'POST', body: fd });
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    state.video = null;
+    $('drop').textContent = 'tap to pick a video';
+    $('drop').classList.remove('has');
+  } catch (err) {
+    alert('upload failed: ' + err.message);
+  }
+  $('go').textContent = 'SWAP IT';
+  ready();
+  poll();
+};
+
+function fmtAge(j) {
+  if (j.status === 'running' && j.started)
+    return `running ${Math.round((Date.now() / 1000 - j.started))}s`;
+  if (j.status === 'done' && j.finished && j.started)
+    return `done in ${Math.round(j.finished - j.started)}s · ${j.quality}`;
+  return j.status + ' · ' + j.quality;
+}
+
+async function poll() {
+  const jobs = await fetch('api/jobs').then(r => r.json()).catch(() => null);
+  if (!jobs) return;
+  const strip = $('strip');
+  strip.innerHTML = jobs.length ? '' : '<div class="empty">nothing cooking yet</div>';
+  for (const j of jobs) {
+    const div = document.createElement('div');
+    div.className = 'job ' + j.status;
+    const spin = (j.status === 'running' || j.status === 'queued') ? '<div class="spin"></div>' : '';
+    const link = j.status === 'done'
+      ? `<a href="api/jobs/${j.id}/result" download>save</a>` : '';
+    const sub = j.status === 'failed'
+      ? `<div class="sub err">${j.error || 'failed'}</div>`
+      : `<div class="sub">${fmtAge(j)}</div>`;
+    div.innerHTML = `${spin}<div class="meta"><div class="name">${j.face} → ${j.video}</div>${sub}</div>${link}`;
+    strip.appendChild(div);
+  }
+}
+
+loadFaces();
+poll();
+setInterval(poll, 3000);
+</script>
+</body>
+</html>

@@ -37,3 +37,15 @@ Or the FaceFusion UI directly:
 ```bash
 cd facefusion && ../.venv/bin/python facefusion.py run
 ```
+
+## Webapp (phone upload)
+
+```bash
+.venv/bin/python webapp/app.py     # http://<mac-lan-or-tailscale-ip>:8877
+```
+
+Phone-friendly page: pick a consented face from the gallery (or add one),
+upload a clip, watch the queue, download the result. Jobs are folders under
+`jobs/<id>/` (`job.json`, `input.*`, `face.*`, `result.mp4`, `swap.log`);
+a crashed worker leaves jobs re-runnable. LAN/Tailscale only — never expose
+the port publicly.
