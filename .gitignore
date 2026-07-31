@@ -9,6 +9,7 @@ __pycache__/
 # private media — never commit faces or footage
 faces/
 jobs/
+photos/
 *.mp4
 *.mov
 *.jpg

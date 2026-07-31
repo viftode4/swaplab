@@ -688,7 +688,7 @@ async function poll() {
     const bar = (j.status === 'running' && j.progress)
       ? `<div class="bar"><i style="width:${j.progress.pct}%"></i></div>` : '';
     const lead = (j.kind === 'photo' && j.status === 'done')
-      ? `<img class="jobthumb" src="api/jobs/${j.id}/result">` : spin;
+      ? `<a href="api/jobs/${j.id}/result" target="_blank"><img class="jobthumb" src="api/jobs/${j.id}/result"></a>` : spin;
     div.innerHTML = `${lead}<div class="meta"><div class="name">${j.face} → ${j.video}</div>${sub}${bar}</div>${link}`;
     strip.appendChild(div);
   }

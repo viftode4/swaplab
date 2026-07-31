@@ -23,6 +23,7 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -331,13 +332,15 @@ async def api_add_photo(photo: UploadFile = File(...)) -> dict:
     await save_upload(photo, dest)
     if ext in HEIC_EXTS:
         jpeg = dest.with_suffix('.jpg')
-        if not sips_to_jpeg(dest, jpeg):
+        if jpeg.exists():
+            jpeg = PHOTOS / f'{base}-{secrets.token_hex(2)}.jpg'
+        if not await run_in_threadpool(sips_to_jpeg, dest, jpeg):
             dest.unlink(missing_ok=True)
             raise HTTPException(400, 'could not convert that HEIC — try exporting as JPEG')
         dest.unlink(missing_ok=True)
         dest = jpeg
     normalize_photo(dest)
-    scan = scan_photo(dest)
+    scan = await run_in_threadpool(scan_photo, dest)
     if not scan.get('faces'):
         dest.unlink(missing_ok=True)
         raise HTTPException(400, 'no faces found in that photo')
@@ -383,7 +386,7 @@ async def api_create_job(
             raise HTTPException(400, 'mapping must be a JSON object')
         if not isinstance(plan, dict) or not plan:
             raise HTTPException(400, 'assign at least one face')
-        scan = scan_photo(source)
+        scan = await run_in_threadpool(scan_photo, source)
         found = len(scan['faces'])
         persons = {}
         for key, person_name in plan.items():
@@ -394,7 +397,12 @@ async def api_create_job(
                     raise HTTPException(400, f'bad face number: {key}')
                 if not 0 <= index < found:
                     raise HTTPException(400, f'face #{key} not found — the photo has {found}')
-            person = FACES / str(person_name)
+            try:
+                person = person_dir(str(person_name))
+            except HTTPException as exc:
+                if exc.status_code != 404:
+                    raise
+                raise HTTPException(400, f'unknown face: {person_name}')
             photos = person_photos(person) if person.is_dir() else []
             if not photos:
                 raise HTTPException(400, f'unknown face: {person_name}')
@@ -467,7 +475,13 @@ async def api_create_job(
         normalize_photo(path / f'face{face_ext}')
         face_label = 'uploaded photo'
     elif face_name:
-        person = FACES / face_name
+        try:
+            person = person_dir(face_name)
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            shutil.rmtree(path)
+            raise HTTPException(400, f'unknown face: {face_name}')
         photos = person_photos(person) if person.is_dir() else []
         if not photos:
             shutil.rmtree(path)

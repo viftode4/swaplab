@@ -596,6 +596,15 @@ def run_facefusion(target: Path, output: Path, processors: list[str],
         fail('facefusion reported success but produced no output file')
 
 
+def count_faces(target: Path) -> int:
+    result = subprocess.run(
+        [str(PYTHON), str(ROOT / 'scan_faces.py'), str(target), str(CONFIG)],
+        cwd=FACEFUSION, capture_output=True, text=True)
+    if result.returncode != 0:
+        fail(f'face scan failed: {(result.stdout or result.stderr).strip()[-300:]}')
+    return len(json.loads(result.stdout.splitlines()[-1]).get('faces', []))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--video', required=True, help='target video (the clip)')
@@ -733,16 +742,21 @@ def main() -> None:
     if args.all_faces:
         selector = ['--face-selector-mode', 'many']
     if mappings:
-        count_json = json.loads(subprocess.run(
-            [str(PYTHON), str(ROOT / 'scan_faces.py'), str(video), str(CONFIG)],
-            cwd=FACEFUSION, capture_output=True, text=True).stdout.splitlines()[-1])
-        found = len(count_json.get('faces', []))
+        found = count_faces(video)
         for index, _ in mappings:
             if not 0 <= index < found:
                 fail(f'--map face #{index}: the photo has {found} face(s), '
                      f'numbered 0..{found - 1} left to right')
         current, temps = video, []
         for pass_number, (index, person) in enumerate(mappings):
+            if pass_number > 0:
+                seen = count_faces(current)
+                if seen != found:
+                    for temp in temps:
+                        temp.unlink(missing_ok=True)
+                    fail(f'face #{index}: the photo now detects {seen} faces '
+                         f'(had {found}) — pass {pass_number} aborted to avoid '
+                         'swapping the wrong face')
             last = pass_number == len(mappings) - 1
             step_out = work_out if last else \
                 work_out.with_name(f'.{work_out.stem}.pass{pass_number}{work_out.suffix}')
