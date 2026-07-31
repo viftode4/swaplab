@@ -587,7 +587,9 @@ def main() -> None:
                         help=f'face editor slider, -1.0..1.0 (repeatable): {", ".join(EDIT_CONTROLS)}')
     parser.add_argument('--puppet', choices=PUPPETS,
                         help='named shorthand that pre-fills --edit values')
-    parser.add_argument('--out', required=True, help='output video path')
+    parser.add_argument('--list-faces', action='store_true',
+                        help='detect faces in the target image, print JSON boxes, and exit')
+    parser.add_argument('--out', required=False, help='output video path')
     parser.add_argument('--quality', choices=QUALITY, default='good')
     parser.add_argument('--cpu', action='store_true', help='force CPU (skip CoreML)')
     args = parser.parse_args()
@@ -595,10 +597,22 @@ def main() -> None:
     video = Path(args.video).expanduser().resolve()
     face = Path(args.face).expanduser().resolve() if args.face else None
     audio = Path(args.audio).expanduser().resolve() if args.audio else None
-    out = Path(args.out).expanduser().resolve()
 
     if not video.is_file():
         fail(f'video not found: {video}')
+    if args.list_faces:
+        if not is_image(video):
+            fail('--list-faces works on images')
+        result = subprocess.run(
+            [str(PYTHON), str(ROOT / 'scan_faces.py'), str(video), str(CONFIG)],
+            cwd=FACEFUSION, capture_output=True, text=True)
+        if result.returncode != 0:
+            fail(f'face scan failed: {(result.stdout or result.stderr).strip()[-300:]}')
+        print(result.stdout.strip().splitlines()[-1])
+        return
+    if not args.out:
+        fail('--out is required')
+    out = Path(args.out).expanduser().resolve()
     edits = parse_edits(args.edit, args.puppet)
     if face is None and audio is None and not edits:
         fail('nothing to do — pass --face, --audio and/or --edit')
