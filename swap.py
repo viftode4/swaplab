@@ -552,11 +552,15 @@ def convert_image(src: Path, dest: Path) -> None:
 
 
 def check_output_image(path: Path, target: Path) -> None:
-    """Verify the result is a readable image at the target's resolution."""
+    """Verify the result is a readable image at the target's resolution.
+
+    Facefusion rounds image output dimensions to even numbers
+    (vision.normalize_resolution), so an odd-sized target legitimately
+    comes back 1px short on that axis — tolerate exactly that."""
     from PIL import Image
     try:
         with Image.open(path) as result, Image.open(target) as original:
-            if result.size != original.size:
+            if any(abs(r - o) > 1 for r, o in zip(result.size, original.size)):
                 fail(f'output is {result.size[0]}x{result.size[1]}, '
                      f'expected {original.size[0]}x{original.size[1]}')
     except OSError as error:
