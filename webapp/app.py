@@ -28,6 +28,7 @@ from fastapi.responses import FileResponse, JSONResponse
 ROOT = Path(__file__).resolve().parent.parent
 FACES = ROOT / 'faces'
 CLIPS = ROOT / 'clips'
+PHOTOS = ROOT / 'photos'
 # drop a clip here from the phone's Files app and it appears in the library
 INBOX = (Path.home() / 'Library/Mobile Documents/com~apple~CloudDocs'
          / 'SwapLab' / 'inbox')
@@ -39,6 +40,7 @@ INDEX = Path(__file__).resolve().parent / 'static' / 'index.html'
 
 VIDEO_EXTS = {'.mp4', '.mov', '.webm'}
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
+HEIC_EXTS = {'.heic', '.heif'}
 AUDIO_EXTS = {'.mp3', '.wav', '.m4a', '.ogg', '.opus', '.flac'}
 QUALITIES = {'fast', 'good', 'best'}
 EDIT_CONTROLS = {'smile', 'pout', 'grim', 'purse', 'lips', 'mouth-x', 'mouth-y',
@@ -117,6 +119,40 @@ def normalize_photo(path: Path) -> None:
             fixed.save(path, quality=95)
     except OSError:
         pass
+
+
+def sips_to_jpeg(src: Path, dest: Path) -> bool:
+    """HEIC → JPEG with macOS's own converter; stays on-device."""
+    result = subprocess.run(
+        ['sips', '-s', 'format', 'jpeg', '-s', 'formatOptions', '95',
+         str(src), '--out', str(dest)], capture_output=True)
+    return result.returncode == 0 and dest.is_file()
+
+
+def scan_photo(photo: Path) -> dict:
+    """Detect faces via swap.py --list-faces; cache beside the photo."""
+    cache = photo.with_name(f'.{photo.stem}.faces.json')
+    if cache.is_file() and cache.stat().st_mtime >= photo.stat().st_mtime:
+        return json.loads(cache.read_text())
+    result = subprocess.run(
+        [str(PYTHON), str(SWAP), '--list-faces', '--video', str(photo)],
+        capture_output=True, text=True, cwd=ROOT)
+    if result.returncode != 0:
+        raise HTTPException(500, 'face detection failed — check the server log')
+    data = json.loads(result.stdout.strip().splitlines()[-1])
+    cache.write_text(json.dumps(data))
+    return data
+
+
+def list_photos() -> list[dict]:
+    photos = []
+    if PHOTOS.is_dir():
+        entries = sorted(PHOTOS.iterdir(), key=lambda p: p.stat().st_mtime,
+                         reverse=True)
+        for entry in entries:
+            if entry.suffix.lower() in IMAGE_EXTS and not entry.name.startswith('.'):
+                photos.append({'name': entry.stem, 'file': entry.name})
+    return photos
 
 
 def list_clips() -> list[dict]:
@@ -277,6 +313,54 @@ def api_clip_thumb(file_name: str) -> FileResponse:
     return FileResponse(thumb, media_type='image/jpeg')
 
 
+@app.get('/api/photos')
+def api_photos() -> list[dict]:
+    return list_photos()
+
+
+@app.post('/api/photos')
+async def api_add_photo(photo: UploadFile = File(...)) -> dict:
+    ext = Path(photo.filename or '').suffix.lower()
+    if ext not in IMAGE_EXTS | HEIC_EXTS:
+        raise HTTPException(400, f'photo must be one of {sorted(IMAGE_EXTS | HEIC_EXTS)}')
+    base = slug(Path(photo.filename or 'photo').stem)
+    PHOTOS.mkdir(exist_ok=True)
+    dest = PHOTOS / f'{base}{ext}'
+    if dest.exists():
+        dest = PHOTOS / f'{base}-{secrets.token_hex(2)}{ext}'
+    await save_upload(photo, dest)
+    if ext in HEIC_EXTS:
+        jpeg = dest.with_suffix('.jpg')
+        if not sips_to_jpeg(dest, jpeg):
+            dest.unlink(missing_ok=True)
+            raise HTTPException(400, 'could not convert that HEIC — try exporting as JPEG')
+        dest.unlink(missing_ok=True)
+        dest = jpeg
+    normalize_photo(dest)
+    scan = scan_photo(dest)
+    if not scan.get('faces'):
+        dest.unlink(missing_ok=True)
+        raise HTTPException(400, 'no faces found in that photo')
+    return {'name': dest.stem, 'file': dest.name, **scan}
+
+
+def photo_path(file_name: str) -> Path:
+    photo = (PHOTOS / file_name).resolve()
+    if photo.parent != PHOTOS.resolve() or not photo.is_file():
+        raise HTTPException(404)
+    return photo
+
+
+@app.get('/api/photos/{file_name}')
+def api_photo(file_name: str) -> FileResponse:
+    return FileResponse(photo_path(file_name))
+
+
+@app.get('/api/photos/{file_name}/faces')
+def api_photo_faces(file_name: str) -> dict:
+    return scan_photo(photo_path(file_name))
+
+
 @app.post('/api/jobs')
 async def api_create_job(
     video: UploadFile | None = File(None),
@@ -288,7 +372,56 @@ async def api_create_job(
     captions: bool = Form(False),
     edit: str = Form(''),
     screen_recording: bool = Form(False),
+    photo_name: str = Form(''),
+    mapping: str = Form(''),
 ) -> dict:
+    if photo_name:
+        source = photo_path(photo_name)     # 404s on nonsense
+        try:
+            plan = json.loads(mapping) if mapping else {}
+        except ValueError:
+            raise HTTPException(400, 'mapping must be a JSON object')
+        if not isinstance(plan, dict) or not plan:
+            raise HTTPException(400, 'assign at least one face')
+        scan = scan_photo(source)
+        found = len(scan['faces'])
+        persons = {}
+        for key, person_name in plan.items():
+            if key != 'all':
+                try:
+                    index = int(key)
+                except ValueError:
+                    raise HTTPException(400, f'bad face number: {key}')
+                if not 0 <= index < found:
+                    raise HTTPException(400, f'face #{key} not found — the photo has {found}')
+            person = FACES / str(person_name)
+            photos = person_photos(person) if person.is_dir() else []
+            if not photos:
+                raise HTTPException(400, f'unknown face: {person_name}')
+            persons[key] = person
+        if 'all' in plan and len(plan) > 1:
+            raise HTTPException(400, 'use "all" alone, or number the faces')
+
+        job_id = f'{time.strftime("%Y%m%d-%H%M%S")}-{secrets.token_hex(3)}'
+        path = JOBS / job_id
+        path.mkdir(parents=True)
+        shutil.copy(source, path / f'input{source.suffix.lower()}')
+        for key, person in persons.items():
+            slot = path / ('face' if key == 'all' else f'face-{key}')
+            slot.mkdir()
+            for photo_file in person_photos(person):
+                shutil.copy(photo_file, slot / photo_file.name)
+        write_job(path, {
+            'id': job_id, 'kind': 'photo', 'status': 'queued',
+            'quality': 'best',
+            'face': ', '.join(f'{k}→{plan[k]}' for k in sorted(plan)),
+            'video': photo_name, 'audio': None, 'captions': False,
+            'edit': None, 'screen_recording': False,
+            'created': time.time(), 'error': None,
+        })
+        wake.set()
+        return {'id': job_id}
+
     if quality not in QUALITIES:
         raise HTTPException(400, f'quality must be one of {sorted(QUALITIES)}')
     edits = {}
@@ -420,11 +553,15 @@ def api_job(job_id: str) -> dict:
 
 @app.get('/api/jobs/{job_id}/result')
 def api_job_result(job_id: str) -> FileResponse:
-    result = job_dir(job_id) / 'result.mp4'
-    if not result.is_file():
-        raise HTTPException(404, 'no result yet')
-    return FileResponse(result, media_type='video/mp4',
-                        filename=f'swap-{job_id}.mp4')
+    path = job_dir(job_id)
+    for name, media in (('result.mp4', 'video/mp4'), ('result.jpg', 'image/jpeg'),
+                        ('result.jpeg', 'image/jpeg'), ('result.png', 'image/png'),
+                        ('result.webp', 'image/webp')):
+        result = path / name
+        if result.is_file():
+            return FileResponse(result, media_type=media,
+                                filename=f'swap-{job_id}{result.suffix}')
+    raise HTTPException(404, 'no result yet')
 
 
 @app.get('/api/jobs/{job_id}/preview')
@@ -452,28 +589,45 @@ def make_preview(path: Path) -> None:
 
 
 def run_job(path: Path, data: dict) -> None:
-    video = next((f for f in path.iterdir() if f.stem == 'input'), None)
-    face = next((f for f in path.iterdir() if f.stem == 'face'), None)  # file or dir
-    if not video or not face:
-        data.update(status='failed', error='job folder is missing input files')
-        write_job(path, data)
-        return
-    command = [str(PYTHON), str(SWAP),
-               '--video', str(video), '--face', str(face),
-               '--out', str(path / 'result.mp4'), '--quality', data['quality']]
-    audio = next((f for f in path.iterdir() if f.stem == 'audio'), None)
-    if audio:
-        command += ['--audio', str(audio)]
-    if data.get('captions'):
-        command += ['--captions']
-    if data.get('screen_recording'):
-        command += ['--screen-recording']
-    for control, value in (data.get('edit') or {}).items():
-        command += ['--edit', f'{control}={value}']
-    if data.get('swapper_model'):
-        command += ['--swapper-model', data['swapper_model']]
-    if data.get('enhancer_model'):
-        command += ['--enhancer-model', data['enhancer_model']]
+    if data.get('kind') == 'photo':
+        photo_file = next((f for f in path.iterdir() if f.stem == 'input'), None)
+        if not photo_file:
+            data.update(status='failed', error='job folder is missing input files')
+            write_job(path, data)
+            return
+        result_file = path / f'result{photo_file.suffix.lower()}'
+        command = [str(PYTHON), str(SWAP), '--video', str(photo_file),
+                   '--out', str(result_file)]
+        all_dir = path / 'face'
+        if all_dir.is_dir():
+            command += ['--face', str(all_dir), '--all-faces']
+        else:
+            for slot in sorted(path.glob('face-*')):
+                command += ['--map', f'{slot.name.split("-", 1)[1]}={slot}']
+    else:
+        video = next((f for f in path.iterdir() if f.stem == 'input'), None)
+        face = next((f for f in path.iterdir() if f.stem == 'face'), None)  # file or dir
+        if not video or not face:
+            data.update(status='failed', error='job folder is missing input files')
+            write_job(path, data)
+            return
+        result_file = path / 'result.mp4'
+        command = [str(PYTHON), str(SWAP),
+                   '--video', str(video), '--face', str(face),
+                   '--out', str(result_file), '--quality', data['quality']]
+        audio = next((f for f in path.iterdir() if f.stem == 'audio'), None)
+        if audio:
+            command += ['--audio', str(audio)]
+        if data.get('captions'):
+            command += ['--captions']
+        if data.get('screen_recording'):
+            command += ['--screen-recording']
+        for control, value in (data.get('edit') or {}).items():
+            command += ['--edit', f'{control}={value}']
+        if data.get('swapper_model'):
+            command += ['--swapper-model', data['swapper_model']]
+        if data.get('enhancer_model'):
+            command += ['--enhancer-model', data['enhancer_model']]
     log = (path / 'swap.log').open('w')
     # own process group so a server restart can clean up the whole render tree
     process = subprocess.Popen(
@@ -484,8 +638,9 @@ def run_job(path: Path, data: dict) -> None:
     returncode = process.wait()
     log.close()
     data['pid'] = None
-    if returncode == 0 and (path / 'result.mp4').is_file():
-        make_preview(path)
+    if returncode == 0 and result_file.is_file():
+        if data.get('kind') != 'photo':
+            make_preview(path)
         data.update(status='done', finished=time.time())
     else:
         tail = (path / 'swap.log').read_text(errors='replace')[-400:].strip()
@@ -561,6 +716,7 @@ def start_worker() -> None:
     JOBS.mkdir(exist_ok=True)
     FACES.mkdir(exist_ok=True)
     CLIPS.mkdir(exist_ok=True)
+    PHOTOS.mkdir(exist_ok=True)
     migrate_flat_faces()
     # a crashed worker leaves 'running' jobs behind — kill any orphaned render
     # (it has no supervisor left to record its result) and make them re-runnable
