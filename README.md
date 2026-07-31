@@ -65,3 +65,23 @@ the port publicly.
 Photo mode: toggle to "photo", pick or upload a picture (HEIC fine), tap a
 numbered face on the image, then tap whose face goes in — or tap 👥 everyone
 to swap every face at once.
+
+## Best identity + picking your swapper
+
+Build a strong multi-angle identity from a short capture video (slow head
+turn + expressions, window light, 4K — see the capture checklist in
+docs/superpowers/specs/2026-07-31-face-identity-design.md):
+
+```bash
+.venv/bin/python identity.py --video vlad-angles.mov --video vlad-expressions.mov --person vlad
+.venv/bin/python bench.py --face faces/vlad     # ranks every swapper on YOUR face
+```
+
+The benchmark winner goes into `facefusion-swaplab.ini` under
+`[face_swapper]` so every swap uses it by default (`--swapper-model`
+still overrides per run).
+
+Want the absolute ceiling? A personal DFM: train with DeepFaceLab on a
+rented NVIDIA GPU (~1-3 days, only your own footage uploaded), export the
+.dfm, drop it in `facefusion/.assets/models/custom/`, and swap with
+`--processors deep_swapper`. No local training — DFL needs CUDA.

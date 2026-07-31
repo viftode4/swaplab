@@ -253,6 +253,7 @@ def main() -> None:
     failed_rows = [(m, r) for m, r in table.items() if 'failed' in r]
 
     print()
+    print('note: mean-sim uses ArcFace, which inswapper directly optimizes — check the contact sheets before crowning it')
     print(f"{'model':<22}{'mean-sim':<11}{'per-target':<30}{'sharpness'}")
     for model, row in ok_rows:
         per_target_str = ' '.join(f'{v:.2f}' if v is not None else '-'
