@@ -1,38 +1,25 @@
 #!/usr/bin/env python3
 """Print the faces facefusion detects in an image, as JSON, left to right.
 
-Run from inside the facefusion checkout with its venv:
-    cd facefusion && ../.venv/bin/python ../scan_faces.py photo.jpg ../facefusion-swaplab.ini
+Run from the repo root with its venv:
+    .venv/bin/python scan_faces.py photo.jpg facefusion-swaplab.ini
 
 Uses facefusion's own detector (pinned commit) so the numbering agrees
 exactly with what --reference-face-position selects during a swap.
 """
 
 import json
-import os
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ff_session
 
 
 def main() -> None:
-    target, config = sys.argv[1], sys.argv[2]
-    # this script lives at the repo root, one level above the facefusion
-    # checkout, so its own directory lands first on sys.path — and that
-    # directory contains a *sibling* folder also named "facefusion" (the
-    # checkout), which shadows the real package one level deeper inside it.
-    # Prepend cwd (the facefusion checkout, per the docstring's usage) so
-    # the real package resolves first, exactly as running facefusion.py
-    # directly already does.
-    sys.path.insert(0, os.getcwd())
-    # feed facefusion's own arg parser so state defaults + our ini apply,
-    # exactly as they do during a real swap
-    sys.argv = ['facefusion.py', 'headless-run', '--config-path', config,
-                '--target-path', target, '--output-path', '/dev/null/unused.jpg',
-                '--face-selector-order', 'left-right',
-                '--processors', 'face_swapper']
-    from facefusion.program import create_program
-    from facefusion.args import apply_args
-    from facefusion import state_manager
-    apply_args(vars(create_program().parse_args()), state_manager.init_item)
+    target = str(Path(sys.argv[1]).resolve())
+    config = str(Path(sys.argv[2]).resolve())
+    ff_session.boot(config, ['--target-path', target])
 
     from facefusion.vision import read_static_image
     from facefusion.face_creator import get_many_faces
