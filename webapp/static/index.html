@@ -62,6 +62,19 @@
     width: 108px; height: 76px; border-radius: 6px;
   }
   .clips .face span { max-width: 112px; }
+  .modechip { margin-left: 8px; text-transform: none; letter-spacing: 0; }
+  .stagewrap { position: relative; margin-top: 10px; }
+  .stagewrap img { width: 100%; border-radius: 6px; display: block; }
+  .facebox {
+    position: absolute; border: 2px solid var(--go); border-radius: 6px;
+    background: none; color: var(--go); font-weight: 800; font-size: 14px;
+    display: grid; place-items: start start; padding: 2px 6px;
+    min-width: 34px; min-height: 34px;
+  }
+  .facebox.sel { background: rgba(200, 255, 46, .18); }
+  .facebox.mapped { border-style: solid; }
+  .facebox i { font-style: normal; background: #101203cc; border-radius: 4px;
+               padding: 1px 6px; }
   .pickwrap { position: relative; display: inline-block; }
   .faceinfo { color: var(--dim); font-size: 13px; padding: 2px 2px 6px;
               display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -143,6 +156,7 @@
     border-radius: 50%; animation: r 0.9s linear infinite;
   }
   @keyframes r { to { transform: rotate(360deg); } }
+  .jobthumb { width: 44px; height: 44px; object-fit: cover; border-radius: 6px; flex-shrink: 0; }
   .empty { color: var(--dim); font-size: 13px; padding: 6px 2px; }
   /* only inputs explicitly marked hidden — a blanket rule here made every
      visible picker untappable */
@@ -158,23 +172,31 @@
 <div class="faces" id="faces"></div>
 <div class="faceinfo" id="faceInfo" hidden></div>
 
-<div class="step"><b>2</b>onto which clip</div>
+<div class="step"><b>2</b>onto which
+  <button class="chip mini modechip sel" data-mode="clip">clip</button>
+  <button class="chip mini modechip" data-mode="photo">photo</button>
+</div>
 <div class="faces clips" id="clips"></div>
+<div class="faces clips" id="photos" hidden></div>
+<div id="photoStage" hidden>
+  <div class="stagewrap"><img id="stageImg" alt=""></div>
+  <div class="faceinfo" id="mapInfo"></div>
+</div>
 
-<div class="step"><b>3</b>how fancy</div>
-<div class="quality" id="quality">
+<div class="step videoonly"><b>3</b>how fancy</div>
+<div class="quality videoonly" id="quality">
   <button data-q="fast">fast</button>
   <button data-q="good" class="sel">good</button>
   <button data-q="best">best</button>
 </div>
 
-<div class="step"><b>4</b>extras <span class="opt">(optional)</span></div>
-<div class="extras">
+<div class="step videoonly"><b>4</b>extras <span class="opt">(optional)</span></div>
+<div class="extras videoonly">
   <label class="chip" for="audioInput" id="voiceChip">🎤 add a voice</label>
   <button class="chip" id="capChip">💬 captions</button>
   <button class="chip" id="screenChip">📱 screen recording</button>
 </div>
-<div class="extras" style="margin-top:10px">
+<div class="extras videoonly" style="margin-top:10px">
   <button class="chip" id="editChip">🎭 face editor</button>
 </div>
 <div id="editor" hidden>
@@ -218,7 +240,8 @@
 <script>
 const state = { face: null, pendingFaceName: null, video: null, clip: null,
                 quality: 'good', audio: null, captions: false,
-                screenRecording: false };
+                screenRecording: false,
+                mode: 'clip', photo: null, photoScan: null, mapping: {}, selBox: null };
 
 // a phone has no console we can read: show failures and report them home
 function report(where, detail) {
@@ -245,7 +268,14 @@ async function loadFaces() {
     b.className = 'face' + (state.face === f.name ? ' sel' : '');
     b.innerHTML = `<img src="api/faces/${encodeURIComponent(f.name)}/thumb?v=${f.count}" alt="">
                    <span>${f.name}${f.count > 1 ? ' · ' + f.count : ''}</span>`;
-    b.onclick = () => { state.face = f.name; state.newFace = null; loadFaces(); ready(); };
+    b.onclick = () => {
+      if (state.mode === 'photo' && state.photo != null && state.selBox != null) {
+        state.mapping[state.selBox] = f.name;
+        state.selBox = null;
+        paintBoxes();
+      }
+      state.face = f.name; state.newFace = null; loadFaces(); ready();
+    };
     box.appendChild(b);
   }
   const add = document.createElement('div');
@@ -375,6 +405,130 @@ function uploadClip(file) {
   xhr.send(fd);
 }
 
+for (const chip of document.querySelectorAll('.modechip')) {
+  chip.onclick = () => {
+    state.mode = chip.dataset.mode;
+    for (const c of document.querySelectorAll('.modechip'))
+      c.classList.toggle('sel', c === chip);
+    $('clips').hidden = state.mode !== 'clip';
+    $('photos').hidden = state.mode !== 'photo';
+    $('photoStage').hidden = state.mode !== 'photo' || !state.photo;
+    const photoMode = state.mode === 'photo';
+    for (const el of document.querySelectorAll('.videoonly')) el.hidden = photoMode;
+    if (photoMode) $('editor').hidden = true;   // chip reopens it in clip mode
+    paintMode(); ready();
+  };
+}
+
+async function loadPhotos() {
+  const photos = await fetch('api/photos').then(r => r.json());
+  const box = $('photos');
+  box.innerHTML = '';
+  for (const p of photos) {
+    const b = document.createElement('button');
+    b.className = 'face' + (state.photo === p.file ? ' sel' : '');
+    b.innerHTML = `<img src="api/photos/${encodeURIComponent(p.file)}" alt="">
+                   <span>${p.name}</span>`;
+    b.onclick = () => selectPhoto(p);
+    box.appendChild(b);
+  }
+  const add = document.createElement('div');
+  add.className = 'face';
+  add.innerHTML = `<div class="blank">+</div><span>new photo</span>
+    <input class="overlay" type="file" accept="image/*,.heic,.heif">`;
+  add.querySelector('input').onchange = e => {
+    const file = e.target.files[0];
+    e.target.value = '';
+    if (file) uploadPhoto(file);
+  };
+  box.appendChild(add);
+}
+
+function uploadPhoto(file) {
+  const box = $('uplog');
+  const mb = (file.size / 1e6).toFixed(1);
+  box.hidden = false; box.classList.remove('err');
+  box.innerHTML = `sending ${file.name} · 0 of ${mb}MB<div class="bar"><i style="width:0"></i></div>`;
+  const fill = box.querySelector('i');
+
+  const fd = new FormData();
+  fd.append('photo', file);
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', 'api/photos');
+  xhr.upload.onprogress = ev => {
+    if (!ev.lengthComputable) return;
+    const pct = Math.round(100 * ev.loaded / ev.total);
+    box.firstChild.textContent = `sending ${file.name} · ${(ev.loaded / 1e6).toFixed(1)} of ${mb}MB (${pct}%)`;
+    fill.style.width = pct + '%';
+  };
+  xhr.onload = async () => {
+    if (xhr.status >= 300) {
+      let detail = xhr.statusText;
+      try { detail = JSON.parse(xhr.responseText).detail || detail; } catch {}
+      report('upload failed', `${xhr.status} ${detail} (${file.name}, ${mb}MB)`);
+      return;
+    }
+    const saved = JSON.parse(xhr.responseText);
+    box.textContent = `${saved.name} uploaded ✓ — tap a face, then who it becomes`;
+    selectPhoto(saved);
+  };
+  xhr.onerror = () => report('upload failed',
+    `connection dropped after ${xhr.upload._sent || '?'} (${file.name}, ${mb}MB)`);
+  xhr.send(fd);
+}
+
+async function selectPhoto(p) {
+  state.photo = p.file;
+  state.photoScan = p.faces ? p : await fetch(`api/photos/${encodeURIComponent(p.file)}/faces`)
+      .then(r => r.json()).then(scan => ({...p, ...scan}));
+  state.mapping = {}; state.selBox = null;
+  $('photoStage').hidden = false;
+  $('stageImg').src = `api/photos/${encodeURIComponent(p.file)}`;
+  paintBoxes(); loadPhotos(); ready();
+}
+
+function paintBoxes() {
+  const wrap = document.querySelector('.stagewrap');
+  for (const old of wrap.querySelectorAll('.facebox')) old.remove();
+  const scan = state.photoScan;
+  if (!scan) return;
+  for (const f of scan.faces) {
+    const b = document.createElement('button');
+    b.className = 'facebox' + (state.selBox === f.index ? ' sel' : '')
+                + (state.mapping[f.index] ? ' mapped' : '');
+    b.style.left = `${100 * f.x / scan.width}%`;
+    b.style.top = `${100 * f.y / scan.height}%`;
+    b.style.width = `${100 * f.w / scan.width}%`;
+    b.style.height = `${100 * f.h / scan.height}%`;
+    b.innerHTML = `<i>${f.index + 1}${state.mapping[f.index] ? ' → ' + state.mapping[f.index] : ''}</i>`;
+    b.onclick = () => { state.selBox = state.selBox === f.index ? null : f.index;
+                        delete state.mapping.all; paintBoxes(); paintMode(); };
+    wrap.appendChild(b);
+  }
+  paintMode();
+}
+
+function paintMode() {
+  if (state.mode !== 'photo' || !state.photoScan) return;
+  const n = Object.keys(state.mapping).filter(k => k !== 'all').length;
+  $('mapInfo').innerHTML = state.mapping.all
+    ? `everyone becomes <b>${state.mapping.all}</b> `
+    : state.selBox != null
+      ? `now tap a face up top to assign face ${state.selBox + 1} `
+      : n ? `${n} face${n > 1 ? 's' : ''} assigned — tap SWAP IT `
+          : `tap a numbered face, then tap whose face goes in `;
+  const all = document.createElement('button');
+  all.className = 'chip mini'; all.textContent = state.mapping.all ? 'undo everyone' : '👥 everyone';
+  all.onclick = () => {
+    if (state.mapping.all) { delete state.mapping.all; }
+    else if (state.face) { state.mapping = { all: state.face }; state.selBox = null; }
+    else { report('photo mode', 'pick whose face goes in first (step 1)'); return; }
+    paintBoxes();
+  };
+  $('mapInfo').appendChild(all);
+  ready();
+}
+
 $('voiceChip').onclick = e => {
   if (state.audio) {          // second tap clears instead of opening the picker
     e.preventDefault();
@@ -433,20 +587,27 @@ $('quality').onclick = e => {
 };
 
 function ready() {
-  $('go').disabled = !((state.video || state.clip) && state.face);
+  $('go').disabled = state.mode === 'photo'
+    ? !(state.photo && (state.mapping.all || Object.keys(state.mapping).length))
+    : !((state.video || state.clip) && state.face);
 }
 
 $('go').onclick = async () => {
   const fd = new FormData();
-  if (state.video) fd.append('video', state.video);
-  else fd.append('clip_name', state.clip);
-  fd.append('quality', state.quality);
-  fd.append('face_name', state.face);
-  if (state.audio) fd.append('audio', state.audio);
-  if (state.captions) fd.append('captions', 'true');
-  if (state.screenRecording) fd.append('screen_recording', 'true');
-  const ed = edits();
-  if (Object.keys(ed).length) fd.append('edit', JSON.stringify(ed));
+  if (state.mode === 'photo') {
+    fd.append('photo_name', state.photo);
+    fd.append('mapping', JSON.stringify(state.mapping));
+  } else {
+    if (state.video) fd.append('video', state.video);
+    else fd.append('clip_name', state.clip);
+    fd.append('quality', state.quality);
+    fd.append('face_name', state.face);
+    if (state.audio) fd.append('audio', state.audio);
+    if (state.captions) fd.append('captions', 'true');
+    if (state.screenRecording) fd.append('screen_recording', 'true');
+    const ed = edits();
+    if (Object.keys(ed).length) fd.append('edit', JSON.stringify(ed));
+  }
   $('go').disabled = true;
   $('go').textContent = 'QUEUEING…';
   const log = m => { $('uplog').hidden = false; $('uplog').classList.remove('err'); $('uplog').textContent = m; };
@@ -468,12 +629,18 @@ $('go').onclick = async () => {
       xhr.onerror = () => reject(new Error('connection dropped — try again'));
       xhr.send(fd);
     });
-    state.video = null;
-    state.audio = null;
-    $('audioInput').value = '';
-    $('voiceChip').textContent = '🎤 add a voice';
-    $('voiceChip').classList.remove('sel');
-    loadClips();
+    if (state.mode === 'photo') {
+      state.mapping = {};
+      state.selBox = null;
+      paintBoxes();
+    } else {
+      state.video = null;
+      state.audio = null;
+      $('audioInput').value = '';
+      $('voiceChip').textContent = '🎤 add a voice';
+      $('voiceChip').classList.remove('sel');
+      loadClips();
+    }
   } catch (err) {
     report('queueing failed', err.message);
   }
@@ -505,8 +672,11 @@ async function poll() {
     div.className = 'job ' + j.status;
     const spin = (j.status === 'running' || j.status === 'queued') ? '<div class="spin"></div>' : '';
     const link = j.status === 'done'
-      ? `<a href="api/jobs/${j.id}/preview" download>save</a>
-         <a class="hd" href="api/jobs/${j.id}/result" download>HD</a>` : '';
+      ? (j.kind === 'photo'
+          ? `<a href="api/jobs/${j.id}/result" download>save</a>`
+          : `<a href="api/jobs/${j.id}/preview" download>save</a>
+             <a class="hd" href="api/jobs/${j.id}/result" download>HD</a>`)
+      : '';
     const extras = (j.audio ? ' · 🎤' : '') + (j.captions ? ' · 💬' : '')
                  + (j.edit ? ' · 🎭' + Object.keys(j.edit).length : '');
     const sub = j.status === 'failed'
@@ -514,13 +684,16 @@ async function poll() {
       : `<div class="sub">${fmtAge(j)}${extras}</div>`;
     const bar = (j.status === 'running' && j.progress)
       ? `<div class="bar"><i style="width:${j.progress.pct}%"></i></div>` : '';
-    div.innerHTML = `${spin}<div class="meta"><div class="name">${j.face} → ${j.video}</div>${sub}${bar}</div>${link}`;
+    const lead = (j.kind === 'photo' && j.status === 'done')
+      ? `<img class="jobthumb" src="api/jobs/${j.id}/result">` : spin;
+    div.innerHTML = `${lead}<div class="meta"><div class="name">${j.face} → ${j.video}</div>${sub}${bar}</div>${link}`;
     strip.appendChild(div);
   }
 }
 
 loadFaces();
 loadClips();
+loadPhotos();
 poll();
 setInterval(poll, 3000);
 </script>
