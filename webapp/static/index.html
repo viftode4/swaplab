@@ -158,6 +158,9 @@
   @keyframes r { to { transform: rotate(360deg); } }
   .jobthumb { width: 44px; height: 44px; object-fit: cover; border-radius: 6px; flex-shrink: 0; }
   .empty { color: var(--dim); font-size: 13px; padding: 6px 2px; }
+  /* .faces/.quality/.extras set display: flex, which beats the UA's
+     [hidden] { display: none } — force it back so hidden actually hides */
+  [hidden] { display: none !important; }
   /* only inputs explicitly marked hidden — a blanket rule here made every
      visible picker untappable */
   input.hidden-input { display: none; }

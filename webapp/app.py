@@ -414,7 +414,10 @@ async def api_create_job(
         write_job(path, {
             'id': job_id, 'kind': 'photo', 'status': 'queued',
             'quality': 'best',
-            'face': ', '.join(f'{k}→{plan[k]}' for k in sorted(plan)),
+            'face': ', '.join(
+                (f'{int(k) + 1}→{plan[k]}' if k != 'all' else f'everyone→{plan[k]}')
+                for k in sorted(plan, key=lambda k: (k != 'all', int(k) if k != 'all' else -1))
+            ),
             'video': photo_name, 'audio': None, 'captions': False,
             'edit': None, 'screen_recording': False,
             'created': time.time(), 'error': None,
