@@ -58,6 +58,21 @@ def decode_frames(video: Path):
     if probe.returncode != 0 or not probe.stdout.strip():
         fail(f'cannot read {video.name}: {probe.stderr.strip()[:200]}')
     width, height = (int(v) for v in probe.stdout.strip().split(',')[:2])
+    # ffprobe's stream=width,height reports CODED dims, but ffmpeg's decode
+    # below applies the display-matrix rotation, so a rotation=+-90 clip
+    # emits height x width frames — swap dims here or the reshape shears.
+    rotation_probe = subprocess.run(
+        [shutil.which('ffprobe'), '-v', 'error', '-select_streams', 'v:0',
+         '-show_entries', 'stream_side_data=rotation', '-of', 'csv=p=0', str(video)],
+        capture_output=True, text=True)
+    rotation_text = rotation_probe.stdout.strip().splitlines()[0].strip() \
+        if rotation_probe.stdout.strip() else ''
+    try:
+        rotation = int(float(rotation_text)) if rotation_text else 0
+    except ValueError:
+        rotation = 0
+    if abs(rotation) % 180 == 90:
+        width, height = height, width
     decode = subprocess.Popen(
         [shutil.which('ffmpeg'), '-v', 'error', '-i', str(video),
          '-vf', f'fps={SAMPLE_FPS}', '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-'],
@@ -179,29 +194,49 @@ def select(candidates: list[dict], keep: int) -> list[dict]:
 
 
 def write_person(person_dir: Path, chosen: list[dict]) -> 'Path | None':
-    """Archive the old set, write the new one; restore the old set on any failure.
+    """Write the new set into a staging dir, archive the old set, then swap in.
 
+    New crops are written to a sibling `.new-<stamp>/` dir first, so the
+    person dir never contains a half-written JPEG — the window where the
+    person dir is touched shrinks to pure renames. On ANY failure, staged
+    and partial files are removed and the old set is fully restored.
     Returns the archive dir if an old set existed, else None.
     """
     import cv2
     stamp = time.strftime('%Y%m%d-%H%M%S')
+    staging = person_dir / f'.new-{stamp}'
     archive = person_dir / f'.old-{stamp}'
     person_dir.mkdir(parents=True, exist_ok=True)
-    existing = [p for p in person_dir.iterdir()
-                if p.is_file() and not p.name.startswith('.')]
-    if existing:
-        archive.mkdir()
-        for photo in existing:
-            photo.rename(archive / photo.name)
+    staging.mkdir()
+    existing = []
+    archived = False
     try:
         for number, c in enumerate(sorted(chosen, key=lambda c: c['bucket']), start=1):
             # crop is already BGR (decode_frames emits bgr24), which is what
             # cv2.imwrite expects — no color conversion needed here.
-            cv2.imwrite(str(person_dir / f'photo-{number}.jpg'), c['crop'],
+            cv2.imwrite(str(staging / f'photo-{number}.jpg'), c['crop'],
                         [cv2.IMWRITE_JPEG_QUALITY, 95])
+        existing = [p for p in person_dir.iterdir()
+                    if p.is_file() and not p.name.startswith('.')]
+        if existing:
+            archive.mkdir(exist_ok=True)
+            for photo in existing:
+                photo.rename(archive / photo.name)
+        archived = True   # existing files (if any) are now fully in `archive`
+        for photo in staging.iterdir():
+            photo.rename(person_dir / photo.name)
+        staging.rmdir()
     except BaseException:
-        for photo in person_dir.glob('photo-*.jpg'):
+        for photo in staging.iterdir():
             photo.unlink(missing_ok=True)
+        if staging.is_dir():
+            staging.rmdir()
+        if archived:
+            # only reachable via the swap-in loop above, so every photo-*.jpg
+            # left in person_dir at this point is a freshly renamed new file —
+            # originals (if any) already moved to `archive` in full
+            for photo in person_dir.glob('photo-*.jpg'):
+                photo.unlink(missing_ok=True)
         if archive.is_dir():
             for photo in archive.iterdir():
                 photo.rename(person_dir / photo.name)
@@ -244,6 +279,9 @@ def main() -> None:
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
 
+    if args.keep < 1:
+        fail('--keep must be at least 1')
+
     # resolve + verify BEFORE boot() (boot chdirs into the facefusion checkout)
     videos = []
     for raw in args.videos:
@@ -256,8 +294,8 @@ def main() -> None:
 
     all_candidates = []
     video_stats = []
-    for i, video in enumerate(videos):
-        candidates, stats = collect(video, video.name, early_guard=(i == 0))
+    for video in videos:
+        candidates, stats = collect(video, video.name, early_guard=True)
         all_candidates.extend(candidates)
         video_stats.append(stats)
 

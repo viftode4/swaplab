@@ -24,6 +24,7 @@ MODELS = ['hyperswap_1a_256', 'hyperswap_1b_256', 'hyperswap_1c_256',
           'ghost_1_256', 'ghost_2_256', 'ghost_3_256',
           'simswap_256', 'inswapper_128_fp16']
 PIXEL_BOOST = '1024x1024'   # valid for every model above at the pinned commit
+PHOTO_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp'}   # same set swap.py's IMAGE_EXTS uses
 
 
 def fail(message: str) -> 'NoReturn':
@@ -194,7 +195,8 @@ def main() -> None:
         fail(f'need >= 2 targets in {targets_dir}, found {len(targets)}')
 
     sources = [str(p) for p in sorted(face_dir.iterdir())
-               if p.is_file() and not p.name.startswith('.')]
+               if p.is_file() and not p.name.startswith('.')
+               and p.suffix.lower() in PHOTO_EXTENSIONS]
     if not sources:
         fail(f'no photos in {face_dir}')
 
@@ -251,6 +253,11 @@ def main() -> None:
     ok_rows = sorted(((m, r) for m, r in table.items() if 'failed' not in r),
                       key=lambda kv: -mean_sim(kv[1]))
     failed_rows = [(m, r) for m, r in table.items() if 'failed' in r]
+
+    if len(ok_rows) < 2:
+        for model, row in failed_rows:
+            print(f"{model}: FAILED: {row['failed']}", file=sys.stderr)
+        fail('fewer than 2 models produced results — no ranking')
 
     print()
     print('note: mean-sim uses ArcFace, which inswapper directly optimizes — check the contact sheets before crowning it')
