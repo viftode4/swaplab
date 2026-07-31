@@ -34,6 +34,16 @@ VIRTUAL_ENV=$PWD/.venv uv pip install -r facefusion/requirements.txt
 # --captions          burn local-whisper auto-subtitles into the video
 ```
 
+Photos work too — an image target always runs the max-quality stills stack
+(`--quality` is ignored):
+
+```bash
+.venv/bin/python swap.py --video group.jpg --face vlad.jpg --out swapped.jpg
+# --all-faces            everyone in the photo becomes --face
+# --map 0=ana --map 2=vlad   face #N (left to right) becomes that person
+# --list-faces           print the numbered face boxes as JSON
+```
+
 Or the FaceFusion UI directly:
 
 ```bash
@@ -51,3 +61,7 @@ upload a clip, watch the queue, download the result. Jobs are folders under
 `jobs/<id>/` (`job.json`, `input.*`, `face.*`, `result.mp4`, `swap.log`);
 a crashed worker leaves jobs re-runnable. LAN/Tailscale only — never expose
 the port publicly.
+
+Photo mode: toggle to "photo", pick or upload a picture (HEIC fine), tap a
+numbered face on the image, then tap whose face goes in — or tap 👥 everyone
+to swap every face at once.
