@@ -26,3 +26,7 @@ photos/
 
 # clip library (private media)
 clips/
+
+# bench.py outputs
+bench-targets/
+bench-results/
