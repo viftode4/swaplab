@@ -90,11 +90,15 @@ def convert_image(src: Path, dest: Path) -> None:
 
 
 def check_output_image(path: Path, target: Path) -> None:
-    """Verify the result is a readable image at the target's resolution."""
+    """Verify the result is a readable image at the target's resolution.
+
+    Facefusion rounds image output dimensions to even numbers
+    (vision.normalize_resolution), so an odd-sized target legitimately
+    comes back 1px short on that axis — tolerate exactly that."""
     from PIL import Image
     try:
         with Image.open(path) as result, Image.open(target) as original:
-            if result.size != original.size:
+            if any(abs(r - o) > 1 for r, o in zip(result.size, original.size)):
                 fail(f'output is {result.size[0]}x{result.size[1]}, '
                      f'expected {original.size[0]}x{original.size[1]}')
     except OSError as error:
@@ -153,7 +157,8 @@ And replace the final validation call:
 .venv/bin/python -c "
 from PIL import Image
 a = Image.open('jobs/.qa-group.jpg'); b = Image.open('jobs/.qa-single.png')
-assert a.size == b.size, (a.size, b.size)
+assert all(abs(x - y) <= 1 for x, y in zip(a.size, b.size)), (a.size, b.size)
+# ≤1px: facefusion rounds image output dims to even (vision.normalize_resolution)
 print('OK', b.size, b.format)"
 ```
 
@@ -915,7 +920,8 @@ In the Webapp section, mention the Photo mode: pick or upload a picture (HEIC fi
 
 - [ ] **Step 2: Full QA matrix re-run**
 
-Re-run the spec's QA list end to end on a fresh server start: single-face photo, group per-face map, all-faces, HEIC, PNG in/PNG out (`--out x.png`), resolution equality (Task 1's assert), video regression (one fast clip job through the webapp). Fix anything that fails before committing.
+Re-run the spec's QA list end to end on a fresh server start: single-face photo, group per-face map, all-faces, HEIC, PNG in/PNG out (`--out x.png`), resolution equality within 1px per axis
+(facefusion rounds image output dims to even — Task 1's assert), video regression (one fast clip job through the webapp). Fix anything that fails before committing.
 
 - [ ] **Step 3: Clean up QA artifacts and commit**
 
