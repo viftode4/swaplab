@@ -99,6 +99,26 @@ QUALITY = {
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
 
 
+def is_image(path: Path) -> bool:
+    return path.suffix.lower() in IMAGE_EXTS
+
+
+# a still has none of the video constraints (flicker, memory, encode time),
+# so photos always run this max stack and ignore the --quality tiers:
+# 1024 pixel boost (video: 512), enhancer blend 80 (video caps it at 25
+# purely to damp temporal flicker), expression restorer keeps the photo's
+# original expression, region masking spares the hairline
+PHOTO_STACK = (['face_swapper', 'expression_restorer', 'face_enhancer'], [
+    '--face-mask-types', 'box', 'region',
+    '--face-mask-blur', '0.4',
+    '--face-swapper-pixel-boost', '1024x1024',
+    '--expression-restorer-factor', '90',
+    '--face-enhancer-blend', '80',
+    '--output-image-quality', '95',
+    '--face-selector-order', 'left-right',
+])
+
+
 def face_photos(path: Path) -> list[Path]:
     """A face is one photo or a directory of photos (averaged identity)."""
     if path.is_dir():
@@ -521,6 +541,28 @@ def check_output_video(path: Path) -> None:
         fail(f'output {path} is not a playable video:\n{probe.stderr.strip()}')
 
 
+def convert_image(src: Path, dest: Path) -> None:
+    """Image-to-image format conversion — the video remux path would
+    re-encode a picture with h264 and mangle it."""
+    from PIL import Image
+    try:
+        Image.open(src).convert('RGB').save(dest, quality=95)
+    except OSError as error:
+        fail(f'could not convert {src.name} to {dest.suffix}: {error}')
+
+
+def check_output_image(path: Path, target: Path) -> None:
+    """Verify the result is a readable image at the target's resolution."""
+    from PIL import Image
+    try:
+        with Image.open(path) as result, Image.open(target) as original:
+            if result.size != original.size:
+                fail(f'output is {result.size[0]}x{result.size[1]}, '
+                     f'expected {original.size[0]}x{original.size[1]}')
+    except OSError as error:
+        fail(f'output {path} is not a readable image: {error}')
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--video', required=True, help='target video (the clip)')
@@ -565,7 +607,7 @@ def main() -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
 
     reference, runs = None, None
-    if video.suffix.lower() not in {'.jpg', '.jpeg', '.png', '.webp'}:
+    if not is_image(video):
         video = normalize_target(video, out.parent, crop_content=args.screen_recording)
         reference = video
         duplicated = duplicate_runs(video)
@@ -583,7 +625,14 @@ def main() -> None:
     if out.suffix.lower() != video.suffix.lower():
         work_out = out.with_name(f'.{out.stem}.work{video.suffix.lower()}')
 
-    processors, extra = QUALITY[args.quality]
+    photo = is_image(video)
+    if photo:
+        if args.quality != 'good':          # 'good' is just the default
+            print('photo target: --quality is ignored, photos always run '
+                  'the max stack', flush=True)
+        processors, extra = PHOTO_STACK
+    else:
+        processors, extra = QUALITY[args.quality]
     sources = []
     if face is None:
         processors, extra = [], []          # lip-sync only, no swap
@@ -640,24 +689,31 @@ def main() -> None:
             work_out.unlink(missing_ok=True)
     else:
         if work_out != out:
-            ffmpeg = shutil.which('ffmpeg') or fail('ffmpeg is required to remux output')
-            remux = subprocess.run(
-                [ffmpeg, '-y', '-v', 'error', '-i', str(work_out), '-c', 'copy', str(out)],
-                capture_output=True, text=True)
-            if remux.returncode != 0:  # container mismatch — re-encode instead
+            if photo:
+                convert_image(work_out, out)
+                work_out.unlink(missing_ok=True)
+            else:
+                ffmpeg = shutil.which('ffmpeg') or fail('ffmpeg is required to remux output')
                 remux = subprocess.run(
-                    [ffmpeg, '-y', '-v', 'error', '-i', str(work_out),
-                     *VIDEO_ENCODE, '-c:a', 'aac', str(out)],
+                    [ffmpeg, '-y', '-v', 'error', '-i', str(work_out), '-c', 'copy', str(out)],
                     capture_output=True, text=True)
-            work_out.unlink(missing_ok=True)
-            if remux.returncode != 0 or not out.is_file():
-                fail(f'could not convert output to {out.suffix}:\n{remux.stderr.strip()}')
-        if not args.no_stabilize and video.suffix.lower() not in {'.jpg', '.jpeg', '.png', '.webp'}:
+                if remux.returncode != 0:  # container mismatch — re-encode instead
+                    remux = subprocess.run(
+                        [ffmpeg, '-y', '-v', 'error', '-i', str(work_out),
+                         *VIDEO_ENCODE, '-c:a', 'aac', str(out)],
+                        capture_output=True, text=True)
+                work_out.unlink(missing_ok=True)
+                if remux.returncode != 0 or not out.is_file():
+                    fail(f'could not convert output to {out.suffix}:\n{remux.stderr.strip()}')
+        if not args.no_stabilize and not photo:
             stabilize(out)
 
     if args.captions:
         burn_captions(out)
-    check_output_video(out)
+    if photo:
+        check_output_image(out, video)
+    else:
+        check_output_video(out)
     if reference is not None and reference.is_file():
         from check import analyze, report
         report(analyze(reference, out))
