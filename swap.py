@@ -12,6 +12,7 @@ voices only. Label output as AI-generated when posting.
 """
 
 import argparse
+import json
 import shutil
 import subprocess
 import sys
@@ -567,6 +568,34 @@ def check_output_image(path: Path, target: Path) -> None:
         fail(f'output {path} is not a readable image: {error}')
 
 
+def run_facefusion(target: Path, output: Path, processors: list[str],
+                   sources: list[str], extra: list[str], cpu: bool) -> None:
+    command = [
+        str(PYTHON), 'facefusion.py', 'headless-run',
+        '--config-path', str(CONFIG),
+        *(['--source-paths', *sources] if sources else []),
+        '--target-path', str(target),
+        '--output-path', str(output),
+        '--processors', *processors,
+        '--execution-providers', 'cpu' if cpu else 'coreml',
+        '--video-memory-strategy', 'moderate',
+        # measured on this Mac: 62s at 1 thread, 57s at 4, 56s at 8 for the
+        # same 60 frames — 4 takes nearly all of the win at less memory
+        '--execution-thread-count', '4',
+        *extra,
+    ]
+    frame_count = video_frames(target) if not is_image(target) else 0
+    if frame_count > CHUNK_FRAMES * 1.5:
+        run_in_chunks(command, output, frame_count)
+    else:
+        result = subprocess.run(command, cwd=FACEFUSION)
+        if result.returncode != 0:
+            fail(f'facefusion exited with {result.returncode} '
+                 '(no face in photo/video and codec issues are the usual causes)')
+    if not output.is_file():
+        fail('facefusion reported success but produced no output file')
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--video', required=True, help='target video (the clip)')
@@ -589,6 +618,11 @@ def main() -> None:
                         help='named shorthand that pre-fills --edit values')
     parser.add_argument('--list-faces', action='store_true',
                         help='detect faces in the target image, print JSON boxes, and exit')
+    parser.add_argument('--all-faces', action='store_true',
+                        help='swap every face in a photo to the --face person')
+    parser.add_argument('--map', action='append', metavar='N=PERSON',
+                        help='photo face #N (left to right, from --list-faces) '
+                             'becomes this person — photo or directory (repeatable)')
     parser.add_argument('--out', required=False, help='output video path')
     parser.add_argument('--quality', choices=QUALITY, default='good')
     parser.add_argument('--cpu', action='store_true', help='force CPU (skip CoreML)')
@@ -614,7 +648,28 @@ def main() -> None:
         fail('--out is required')
     out = Path(args.out).expanduser().resolve()
     edits = parse_edits(args.edit, args.puppet)
-    if face is None and audio is None and not edits:
+    mappings: list[tuple[int, Path]] = []
+    for pair in args.map or []:
+        index_raw, _, person_raw = pair.partition('=')
+        try:
+            index = int(index_raw)
+        except ValueError:
+            fail(f'--map {pair!r}: face number must be an integer')
+        person = Path(person_raw).expanduser().resolve()
+        if not (person.is_file() or person.is_dir()):
+            fail(f'--map face photo not found: {person}')
+        if any(index == seen for seen, _ in mappings):
+            fail(f'--map face #{index} given twice')
+        mappings.append((index, person))
+    if mappings and (face is not None or args.all_faces):
+        fail('--map replaces --face/--all-faces — use one or the other')
+    if (mappings or args.all_faces) and not is_image(video):
+        fail('--all-faces and --map work on photos (image targets) only')
+    if args.all_faces and face is None:
+        fail('--all-faces needs --face to say who everyone becomes')
+    if mappings and (audio is not None or edits):
+        fail('--map cannot be combined with --audio or --edit')
+    if face is None and audio is None and not edits and not mappings:
         fail('nothing to do — pass --face, --audio and/or --edit')
     if face is not None and not (face.is_file() or face.is_dir()):
         fail(f'face photo not found: {face}')
@@ -652,9 +707,9 @@ def main() -> None:
     else:
         processors, extra = QUALITY[args.quality]
     sources = []
-    if face is None:
+    if face is None and not mappings:
         processors, extra = [], []          # lip-sync only, no swap
-    else:
+    elif face is not None:
         sources.extend(str(p) for p in face_photos(face))
     if args.swapper_model:
         extra = [*extra, '--face-swapper-model', args.swapper_model]
@@ -672,33 +727,45 @@ def main() -> None:
         processors = [*processors[:slot], 'lip_syncer', *processors[slot:]]
         sources.append(str(audio))
 
-    command = [
-        str(PYTHON), 'facefusion.py', 'headless-run',
-        '--config-path', str(CONFIG),
-        *(['--source-paths', *sources] if sources else []),
-        '--target-path', str(video),
-        '--output-path', str(work_out),
-        '--processors', *processors,
-        '--execution-providers', 'cpu' if args.cpu else 'coreml',
-        '--video-memory-strategy', 'moderate',
-        # measured on this Mac: 62s at 1 thread, 57s at 4, 56s at 8 for the
-        # same 60 frames — 4 takes nearly all of the win at less memory
-        '--execution-thread-count', '4',
-        # 'one' swaps the most prominent face every frame; 'reference' mode
-        # dropped frames whenever the actor turned away from the reference pose
-        '--face-selector-mode', 'one',
-        *extra,
-    ]
-    frame_count = video_frames(video)
-    if frame_count > CHUNK_FRAMES * 1.5:
-        run_in_chunks(command, work_out, frame_count)
+    # 'one' swaps the most prominent face every frame; 'reference' mode
+    # dropped frames whenever the actor turned away from the reference pose
+    selector = ['--face-selector-mode', 'one']
+    if args.all_faces:
+        selector = ['--face-selector-mode', 'many']
+    if mappings:
+        count_json = json.loads(subprocess.run(
+            [str(PYTHON), str(ROOT / 'scan_faces.py'), str(video), str(CONFIG)],
+            cwd=FACEFUSION, capture_output=True, text=True).stdout.splitlines()[-1])
+        found = len(count_json.get('faces', []))
+        for index, _ in mappings:
+            if not 0 <= index < found:
+                fail(f'--map face #{index}: the photo has {found} face(s), '
+                     f'numbered 0..{found - 1} left to right')
+        current, temps = video, []
+        for pass_number, (index, person) in enumerate(mappings):
+            last = pass_number == len(mappings) - 1
+            step_out = work_out if last else \
+                work_out.with_name(f'.{work_out.stem}.pass{pass_number}{work_out.suffix}')
+            pass_sources = [str(p) for p in face_photos(person)]
+            try:
+                run_facefusion(current, step_out, processors, pass_sources,
+                               [*extra, '--face-selector-mode', 'reference',
+                                '--reference-face-position', str(index)],
+                               args.cpu)
+            except SystemExit:
+                for temp in temps:
+                    temp.unlink(missing_ok=True)
+                print(f'swap.py: face #{index} ({person.name}) was the pass '
+                      'that failed', file=sys.stderr)
+                raise
+            if not last:
+                temps.append(step_out)
+            current = step_out
+        for temp in temps:
+            temp.unlink(missing_ok=True)
     else:
-        result = subprocess.run(command, cwd=FACEFUSION)
-        if result.returncode != 0:
-            fail(f'facefusion exited with {result.returncode} '
-                 '(no face in photo/video and codec issues are the usual causes)')
-    if not work_out.is_file():
-        fail('facefusion reported success but produced no output file')
+        run_facefusion(video, work_out, processors, sources,
+                       [*selector, *extra], args.cpu)
 
     if runs:
         restore_timing(work_out, runs, reference, out,
