@@ -66,6 +66,13 @@ Photo mode: toggle to "photo", pick or upload a picture (HEIC fine), tap a
 numbered face on the image, then tap whose face goes in — or tap 👥 everyone
 to swap every face at once.
 
+A photo renders through **every swapper** (~2.5 min, one at a time) and the
+job card shows a strip of results — tap one to compare, then save that one.
+No model is right for every target, and the ArcFace ranking disagrees with
+the eye, so the picker exists to let you judge. Video stays on the single
+configured default; all eight would take hours (see the spec in
+docs/superpowers/specs/2026-08-01-multi-model-photo-picker-design.md).
+
 Adding a **photo** to a person appends it. Adding a **capture video** queues an
 `identity.py` build that *rebuilds* that person from the video (old set archived
 to `faces/<person>/.old-<stamp>/`); the clip stays in the job folder, so a

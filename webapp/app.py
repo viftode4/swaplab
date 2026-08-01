@@ -45,6 +45,19 @@ IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
 HEIC_EXTS = {'.heic', '.heif'}
 AUDIO_EXTS = {'.mp3', '.wav', '.m4a', '.ogg', '.opus', '.flac'}
 QUALITIES = {'fast', 'good', 'best'}
+# Every swapper the pinned facefusion ships, ordered by visual family: near
+# neighbours differ subtly, so a real difference in the picker stands out.
+# ArcFace ranking disagrees with the eye here (it crowned inswapper while
+# ghost_1/ghost_2 visibly feminized the face), which is the whole reason a
+# photo renders all of them and you choose.
+SWAPPER_MODELS = ['inswapper_128_fp16',
+                  'hyperswap_1a_256', 'hyperswap_1b_256', 'hyperswap_1c_256',
+                  'ghost_1_256', 'ghost_2_256', 'ghost_3_256',
+                  'simswap_256']
+PHOTO_THUMB_WIDTH = 400     # the picker strip; the full file waits for a save
+RETRY_PAUSE = 5
+# CoreML reports contention as a failed prediction, not as a busy signal
+TRANSIENT_MARKERS = ('Unable to compute the prediction', 'CoreML', 'ML Program')
 EDIT_CONTROLS = {'smile', 'pout', 'grim', 'purse', 'lips', 'mouth-x', 'mouth-y',
                  'eyes', 'brows', 'gaze-x', 'gaze-y', 'pitch', 'yaw', 'roll'}
 
@@ -408,6 +421,7 @@ async def api_create_job(
         write_job(path, {
             'id': job_id, 'kind': 'photo', 'status': 'queued',
             'quality': 'best',
+            'models': SWAPPER_MODELS, 'done_models': 0, 'results': [],
             'face': ', '.join(
                 (f'{int(k) + 1}→{plan[k]}' if k != 'all' else f'everyone→{plan[k]}')
                 for k in sorted(plan, key=lambda k: (k != 'all', int(k) if k != 'all' else -1))
@@ -554,17 +568,44 @@ def api_job(job_id: str) -> dict:
     return data
 
 
+RESULT_MEDIA = {'.mp4': 'video/mp4', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+                '.png': 'image/png', '.webp': 'image/webp'}
+
+
+def result_stems(job_id: str, model: str | None) -> list[str]:
+    """A photo job holds one result per swapper; everything else holds one."""
+    if model:
+        if model not in SWAPPER_MODELS:
+            raise HTTPException(404, 'unknown model')
+        return [f'result-{model}']
+    # no model asked for: the first that rendered, so old links still resolve
+    data = read_job(JOBS / job_id) or {}
+    picked = [f"result-{r['model']}" for r in (data.get('results') or [])
+              if r.get('ok') and r.get('model')]
+    return ['result', *picked]
+
+
 @app.get('/api/jobs/{job_id}/result')
-def api_job_result(job_id: str) -> FileResponse:
+def api_job_result(job_id: str, model: str | None = None) -> FileResponse:
     path = job_dir(job_id)
-    for name, media in (('result.mp4', 'video/mp4'), ('result.jpg', 'image/jpeg'),
-                        ('result.jpeg', 'image/jpeg'), ('result.png', 'image/png'),
-                        ('result.webp', 'image/webp')):
-        result = path / name
-        if result.is_file():
-            return FileResponse(result, media_type=media,
-                                filename=f'swap-{job_id}{result.suffix}')
+    for stem in result_stems(job_id, model):
+        for suffix, media in RESULT_MEDIA.items():
+            result = path / f'{stem}{suffix}'
+            if result.is_file():
+                return FileResponse(result, media_type=media,
+                                    filename=f'swap-{job_id}{result.suffix}')
     raise HTTPException(404, 'no result yet')
+
+
+@app.get('/api/jobs/{job_id}/thumb')
+def api_job_thumb(job_id: str, model: str | None = None) -> FileResponse:
+    """Picker-sized copy, so eight results cost a phone one small strip."""
+    path = job_dir(job_id)
+    for stem in result_stems(job_id, model):
+        thumb = path / f'{stem}-thumb.jpg'
+        if thumb.is_file():
+            return FileResponse(thumb, media_type='image/jpeg')
+    return api_job_result(job_id, model)
 
 
 @app.get('/api/jobs/{job_id}/preview')
@@ -591,7 +632,116 @@ def make_preview(path: Path) -> None:
         capture_output=True)
 
 
+def is_transient(text: str) -> bool:
+    """A contended CoreML run looks exactly like a broken model. Tell them apart."""
+    return any(marker in (text or '') for marker in TRANSIENT_MARKERS)
+
+
+def failure_reason(text: str) -> str:
+    """Our tools fail with a "<tool>.py: <reason>" line; prefer it over the
+    last line, which is whatever progress output happened to come last."""
+    lines = (text or '').strip().splitlines()
+    reason = next((line for line in reversed(lines)
+                   if re.match(r'^\w+\.py: ', line)), None)
+    return reason or (lines[-1][-400:] if lines else 'swap failed')
+
+
+def launch(command: list[str], log_path: Path, path: Path, data: dict) -> tuple[int, str]:
+    """Run one tool subprocess to completion; return its code and log text.
+
+    Unbuffered, or the tool's block-buffered stdout flushes at exit and lands
+    AFTER the stderr failure line, scrambling the log's chronology. Own process
+    group so a server restart can clean up the whole render tree.
+    """
+    with log_path.open('w') as log:
+        process = subprocess.Popen(
+            command, stdout=log, stderr=subprocess.STDOUT, cwd=ROOT,
+            env={**os.environ, 'PYTHONUNBUFFERED': '1'},
+            start_new_session=True)
+        data['pid'] = process.pid
+        write_job(path, data)
+        returncode = process.wait()
+    return returncode, log_path.read_text(errors='replace')
+
+
+def photo_command(path: Path, photo_file: Path, out: Path) -> list[str]:
+    command = [str(PYTHON), str(SWAP), '--video', str(photo_file), '--out', str(out)]
+    all_dir = path / 'face'
+    if all_dir.is_dir():
+        command += ['--face', str(all_dir), '--all-faces']
+    else:
+        for slot in sorted(path.glob('face-*')):
+            command += ['--map', f'{slot.name.split("-", 1)[1]}={slot}']
+    return command
+
+
+def make_photo_thumb(result: Path) -> None:
+    """Small copy for the picker strip — eight full results is ~20MB to a phone."""
+    from PIL import Image
+    try:
+        img = Image.open(result)
+        img.thumbnail((PHOTO_THUMB_WIDTH, PHOTO_THUMB_WIDTH * 4))
+        img.convert('RGB').save(thumb_path(result), 'JPEG', quality=82)
+    except OSError:
+        pass        # a missing thumb only costs the strip a tile
+
+
+def thumb_path(result: Path) -> Path:
+    return result.with_name(f'{result.stem}-thumb.jpg')
+
+
+def run_photo_job(path: Path, data: dict) -> None:
+    """One photo through every swapper, so the choice is made by eye.
+
+    Strictly sequential: concurrent CoreML work makes models fail with
+    "Unable to compute the prediction using ML Program" — that is how a
+    contended benchmark run silently lost hyperswap_1b and 1c, the two that
+    held facial structure best. One failed model never sinks the job.
+    """
+    photo_file = next((f for f in path.iterdir() if f.stem == 'input'), None)
+    if not photo_file:
+        data.update(status='failed', error='job folder is missing input files')
+        write_job(path, data)
+        return
+    suffix = photo_file.suffix.lower()
+    models = data.get('models') or [None]
+    data.update(status='running', started=time.time(), error=None, results=[])
+    write_job(path, data)
+
+    results = []
+    for model in models:
+        out = path / (f'result-{model}{suffix}' if model else f'result{suffix}')
+        log = path / (f'swap-{model}.log' if model else 'swap.log')
+        command = photo_command(path, photo_file, out)
+        if model:
+            command += ['--swapper-model', model]
+        returncode, text = launch(command, log, path, data)
+        ok = returncode == 0 and out.is_file()
+        if not ok and is_transient(text):
+            time.sleep(RETRY_PAUSE)
+            returncode, text = launch(command, log, path, data)
+            ok = returncode == 0 and out.is_file()
+        if ok:
+            make_photo_thumb(out)
+        results.append({'model': model, 'ok': ok,
+                        'error': None if ok else failure_reason(text)})
+        data['results'] = results
+        data['done_models'] = sum(1 for r in results if r['ok'])
+        write_job(path, data)
+
+    data['pid'] = None
+    if any(r['ok'] for r in results):
+        data.update(status='done', finished=time.time())
+    else:
+        data.update(status='failed', finished=time.time(),
+                    error=next((r['error'] for r in results if r['error']), 'swap failed'))
+    write_job(path, data)
+
+
 def run_job(path: Path, data: dict) -> None:
+    if data.get('kind') == 'photo':
+        run_photo_job(path, data)
+        return
     result_file = None
     if data.get('kind') == 'identity':
         clip = next((f for f in path.iterdir() if f.stem == 'input'), None)
@@ -601,21 +751,6 @@ def run_job(path: Path, data: dict) -> None:
             return
         command = [str(PYTHON), str(IDENTITY), '--video', str(clip),
                    '--person', data['person']]
-    elif data.get('kind') == 'photo':
-        photo_file = next((f for f in path.iterdir() if f.stem == 'input'), None)
-        if not photo_file:
-            data.update(status='failed', error='job folder is missing input files')
-            write_job(path, data)
-            return
-        result_file = path / f'result{photo_file.suffix.lower()}'
-        command = [str(PYTHON), str(SWAP), '--video', str(photo_file),
-                   '--out', str(result_file)]
-        all_dir = path / 'face'
-        if all_dir.is_dir():
-            command += ['--face', str(all_dir), '--all-faces']
-        else:
-            for slot in sorted(path.glob('face-*')):
-                command += ['--map', f'{slot.name.split("-", 1)[1]}={slot}']
     else:
         video = next((f for f in path.iterdir() if f.stem == 'input'), None)
         face = next((f for f in path.iterdir() if f.stem == 'face'), None)  # file or dir
@@ -640,37 +775,21 @@ def run_job(path: Path, data: dict) -> None:
             command += ['--swapper-model', data['swapper_model']]
         if data.get('enhancer_model'):
             command += ['--enhancer-model', data['enhancer_model']]
-    log = (path / 'swap.log').open('w')
-    # own process group so a server restart can clean up the whole render tree
-    # unbuffered, or the tool's block-buffered stdout flushes at exit and lands
-    # AFTER the stderr failure line, scrambling the log's chronology
-    process = subprocess.Popen(
-        command, stdout=log, stderr=subprocess.STDOUT, cwd=ROOT,
-        env={**os.environ, 'PYTHONUNBUFFERED': '1'},
-        start_new_session=True)
-    data.update(status='running', started=time.time(), error=None, pid=process.pid)
-    write_job(path, data)
-    returncode = process.wait()
-    log.close()
+    data.update(status='running', started=time.time(), error=None)
+    returncode, text = launch(command, path / 'swap.log', path, data)
     data['pid'] = None
     if returncode == 0 and (result_file is None or result_file.is_file()):
-        if data.get('kind') not in ('photo', 'identity'):
+        if data.get('kind') != 'identity':
             make_preview(path)
         data.update(status='done', finished=time.time())
         if data.get('kind') == 'identity':
             # identity.py's last line reports what was written and what was
             # archived — the only useful outcome of a build with no result file
-            report = (path / 'swap.log').read_text(errors='replace').strip()
+            report = text.strip()
             data['summary'] = report.splitlines()[-1] if report else None
     else:
-        # our tools fail with a "<tool>.py: <reason>" line; prefer it over the
-        # last line, which is whatever progress output happened to come last
-        text = (path / 'swap.log').read_text(errors='replace').strip()
-        lines = text.splitlines()
-        reason = next((line for line in reversed(lines)
-                       if re.match(r'^\w+\.py: ', line)), None)
         data.update(status='failed', finished=time.time(),
-                    error=reason or (lines[-1][-400:] if lines else 'swap failed'))
+                    error=failure_reason(text))
     write_job(path, data)
 
 

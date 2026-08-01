@@ -157,6 +157,18 @@
   }
   @keyframes r { to { transform: rotate(360deg); } }
   .jobthumb { width: 44px; height: 44px; object-fit: cover; border-radius: 6px; flex-shrink: 0; }
+  /* eight swappers is wider than a phone — the strip scrolls, the card doesn't */
+  .picks { display: flex; gap: 6px; margin-top: 8px; padding-bottom: 2px;
+           overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .pick { flex: 0 0 auto; background: none; border: 1px solid #3a3e46;
+          border-radius: 6px; padding: 3px; cursor: pointer;
+          display: flex; flex-direction: column; align-items: center; gap: 3px; }
+  .pick.on { border-color: var(--go); }
+  .pick img { width: 56px; height: 56px; object-fit: cover;
+              border-radius: 4px; display: block; }
+  .pick span { color: var(--dim); font-size: 10px; max-width: 60px;
+               overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pick.on span { color: var(--go); }
   .empty { color: var(--dim); font-size: 13px; padding: 6px 2px; }
   /* .faces/.quality/.extras set display: flex, which beats the UA's
      [hidden] { display: none } — force it back so hidden actually hides */
@@ -658,6 +670,8 @@ $('go').onclick = async () => {
 function fmtAge(j) {
   if (j.status === 'running') {
     const t = j.started ? `${Math.round(Date.now() / 1000 - j.started)}s` : '';
+    if (j.kind === 'photo' && j.models)      // one render per swapper, in turn
+      return `model ${(j.results || []).length + 1} of ${j.models.length} · ${t}`;
     return j.progress ? `${j.progress.stage} ${j.progress.pct}% · ${t}`
                       : `starting up · ${t}`;
   }
@@ -669,6 +683,16 @@ function fmtAge(j) {
 }
 
 const identityDone = new Set();
+const photoPick = {};        // jobId -> chosen model, survives the 3s poll
+
+// a photo renders once per swapper; only the ones that came out are offered
+const photoResults = j => (j.results || []).filter(r => r.ok && r.model);
+// the variant letter IS the label — "hyperswap_1a_256" truncates to
+// "hyperswap…" in a 56px tile, making 1a/1b/1c indistinguishable
+const modelLabel = m => m
+  .replace('_fp16', '').replace(/_(128|256)$/, '')
+  .replace('hyperswap_', 'hyper ').replace('ghost_', 'ghost ')
+  .replace('inswapper', 'inswap');
 
 async function poll() {
   const jobs = await fetch('api/jobs').then(r => r.json()).catch(() => null);
@@ -684,10 +708,15 @@ async function poll() {
     const div = document.createElement('div');
     div.className = 'job ' + j.status;
     const spin = (j.status === 'running' || j.status === 'queued') ? '<div class="spin"></div>' : '';
+    const picks = j.kind === 'photo' ? photoResults(j) : [];
+    if (picks.length && !picks.some(r => r.model === photoPick[j.id]))
+      photoPick[j.id] = picks[0].model;     // default to the first that rendered
+    const chosen = photoPick[j.id];
+    const q = picks.length ? `?model=${encodeURIComponent(chosen)}` : '';
     const link = j.status !== 'done' || j.kind === 'identity'
       ? ''                                  // an identity build has no file to save
       : (j.kind === 'photo'
-          ? `<a href="api/jobs/${j.id}/result" download>save</a>`
+          ? `<a href="api/jobs/${j.id}/result${q}" download>save</a>`
           : `<a href="api/jobs/${j.id}/preview" download>save</a>
              <a class="hd" href="api/jobs/${j.id}/result" download>HD</a>`);
     const extras = (j.audio ? ' · 🎤' : '') + (j.captions ? ' · 💬' : '')
@@ -697,9 +726,19 @@ async function poll() {
       : `<div class="sub">${j.summary || fmtAge(j)}${extras}</div>`;
     const bar = (j.status === 'running' && j.progress)
       ? `<div class="bar"><i style="width:${j.progress.pct}%"></i></div>` : '';
+    // thumb, not result: eight full-size renders would be ~20MB to a phone
     const lead = (j.kind === 'photo' && j.status === 'done')
-      ? `<a href="api/jobs/${j.id}/result" target="_blank"><img class="jobthumb" src="api/jobs/${j.id}/result"></a>` : spin;
-    div.innerHTML = `${lead}<div class="meta"><div class="name">${j.face} → ${j.video}</div>${sub}${bar}</div>${link}`;
+      ? `<a href="api/jobs/${j.id}/result${q}" target="_blank">
+           <img class="jobthumb" src="api/jobs/${j.id}/thumb${q}"></a>` : spin;
+    const picker = picks.length > 1
+      ? `<div class="picks">` + picks.map(r =>
+          `<button class="pick${r.model === chosen ? ' on' : ''}" data-model="${r.model}">
+             <img src="api/jobs/${j.id}/thumb?model=${encodeURIComponent(r.model)}">
+             <span>${modelLabel(r.model)}</span></button>`).join('') + `</div>`
+      : '';
+    div.innerHTML = `${lead}<div class="meta"><div class="name">${j.face} → ${j.video}</div>${sub}${bar}${picker}</div>${link}`;
+    for (const button of div.querySelectorAll('.pick'))
+      button.onclick = () => { photoPick[j.id] = button.dataset.model; poll(); };
     strip.appendChild(div);
   }
 }
