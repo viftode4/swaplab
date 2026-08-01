@@ -84,9 +84,19 @@ docs/superpowers/specs/2026-07-31-face-identity-design.md):
 .venv/bin/python bench.py --face faces/vlad     # ranks every swapper on YOUR face
 ```
 
-The benchmark winner goes into `facefusion-swaplab.ini` under
-`[face_swapper]` so every swap uses it by default (`--swapper-model`
-still overrides per run).
+The benchmark winner goes into `facefusion-swaplab.ini` as
+`face_swapper_model` under `[processors]` — facefusion has no
+`[face_swapper]` section, so a model set there is silently ignored
+(verify with `state_manager.get_item('face_swapper_model')` after a
+boot). Every swap then uses it by default; `--swapper-model` still
+overrides per run.
+
+Read the contact sheets before trusting the ranking: mean-sim is ArcFace,
+which inswapper optimizes directly. On vlad's identity, ghost_1/ghost_2
+outscored hyperswap_1a while visibly feminizing the face (fuller redder
+lips, heavier brows) — the self-swap target, where the source and target
+are the same person, is the clearest read on which model keeps bone
+structure.
 
 Want the absolute ceiling? A personal DFM: train with DeepFaceLab on a
 rented NVIDIA GPU (~1-3 days, only your own footage uploaded), export the
