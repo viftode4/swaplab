@@ -130,6 +130,7 @@ def collect(video: Path, video_tag: str, early_guard: bool = False) -> tuple[lis
     from facefusion.face_creator import get_many_faces
     candidates = []
     frames = faces = dropped_size = dropped_score = 0
+    tallest = 0.0
     for index, frame in decode_frames(video):
         frames += 1
         detected = get_many_faces([frame])
@@ -137,6 +138,7 @@ def collect(video: Path, video_tag: str, early_guard: bool = False) -> tuple[lis
             faces += 1
             face = max(detected, key=lambda f: (f.bounding_box[3] - f.bounding_box[1]))
             x1, y1, x2, y2 = (float(v) for v in face.bounding_box)
+            tallest = max(tallest, y2 - y1)
             if (y2 - y1) < MIN_FACE_HEIGHT:
                 dropped_size += 1
             elif face.score_set.get('detector', 0) < MIN_DETECTOR_SCORE:
@@ -157,7 +159,20 @@ def collect(video: Path, video_tag: str, early_guard: bool = False) -> tuple[lis
                         'bucket': bucket_of(yaw, pitch), 'yaw': yaw, 'pitch': pitch,
                     })
         if early_guard and frames == EARLY_GUARD_FRAMES and not candidates:
-            fail(f'no face found in the first {EARLY_GUARD_FRAMES} frames of {video.name} — wrong clip?')
+            # "no candidates" means either nothing was detected or everything
+            # was filtered — very different problems, so never report them alike
+            if not faces:
+                fail(f'no face found in the first {EARLY_GUARD_FRAMES} frames of '
+                     f'{video.name} — wrong clip?')
+            height, width = frame.shape[:2]
+            if dropped_size >= dropped_score:
+                fail(f'{video.name}: found a face in {faces}/{frames} frames but every one '
+                     f'was too small — tallest {tallest:.0f}px, need >= {MIN_FACE_HEIGHT}. '
+                     f'The video decoded at {width}x{height}; upload it at full resolution '
+                     f'(iOS re-encodes videos picked from the photo library) or fill more '
+                     f'of the frame with the face.')
+            fail(f'{video.name}: found a face in {faces}/{frames} frames but every one scored '
+                 f'below {MIN_DETECTOR_SCORE} — too blurry, dark, or occluded to use.')
 
     dropped_sharpness = 0
     if candidates:
