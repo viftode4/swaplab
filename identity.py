@@ -91,20 +91,33 @@ def decode_frames(video: Path):
 def pose_proxies(landmark_5) -> tuple[float, float]:
     """Yaw/pitch proxies from the 5-point landmarks (no extra models).
 
-    yaw: nose x-offset from the eye midpoint, normalized by inter-eye
-    distance — 0 frontal, positive when looking right.
-    pitch: nose y-position within the eye-to-mouth span — ~0.55 level,
-    smaller looking up, larger looking down.
+    Both are the nose's offset from the eye midpoint, measured in a frame
+    aligned to the eye->mouth axis and normalized by that span:
+    yaw across it (0 frontal, positive looking right), pitch along it
+    (~0.55 level, smaller looking up, larger looking down).
+
+    The span is the denominator, not the inter-eye distance, because
+    turning the head foreshortens the eye line while leaving the vertical
+    span alone — measured on a real capture, inter-eye ran 434px frontal
+    to 139px at profile (3.1x). Dividing by a denominator that collapses
+    as the numerator grows made yaw accelerate through the middle of its
+    range, so intermediate buckets sampled empty at 4 fps while the
+    extremes piled up (a capture turning both ways scored right=0 next to
+    far-right=4, which no continuous head turn can do). Aligning to the
+    eye axis also keeps head roll from leaking into either number.
     """
     import numpy as np
     points = np.asarray(landmark_5, dtype=float)
     eye_l, eye_r, nose, mouth_l, mouth_r = points
     mid_eye = (eye_l + eye_r) / 2
     mid_mouth = (mouth_l + mouth_r) / 2
-    inter_eye = np.linalg.norm(eye_r - eye_l) or 1.0
-    span = (mid_mouth[1] - mid_eye[1]) or 1.0
-    yaw = float((nose[0] - mid_eye[0]) / inter_eye)
-    pitch = float((nose[1] - mid_eye[1]) / span)
+    down = mid_mouth - mid_eye
+    span = float(np.linalg.norm(down)) or 1.0
+    down = down / span
+    across = np.array([down[1], -down[0]])      # perpendicular, points right
+    offset = nose - mid_eye
+    yaw = float(np.dot(offset, across) / span)
+    pitch = float(np.dot(offset, down) / span)
     return yaw, pitch
 
 
@@ -176,8 +189,20 @@ def collect(video: Path, video_tag: str, early_guard: bool = False) -> tuple[lis
 
     dropped_sharpness = 0
     if candidates:
-        floor = np.percentile([c['sharp'] for c in candidates], SHARPNESS_PERCENTILE)
-        kept = [c for c in candidates if c['sharp'] >= floor]
+        # Cut the blurriest per POSE BUCKET, never across the whole clip. A
+        # global floor is pose-blind, and blur correlates with turning: you
+        # hold still at the extremes and move through the middle, so the
+        # mid-turn frames are the blurry ones. Measured on a real capture,
+        # a global cut kept 35/56 centre frames while erasing right (0/3)
+        # and left (1/3) outright — deleting the rarest poses to keep the
+        # most abundant. Ranking within a bucket compares like with like.
+        by_bucket: dict[tuple, list] = {}
+        for c in candidates:
+            by_bucket.setdefault(c['bucket'], []).append(c)
+        kept = []
+        for group in by_bucket.values():
+            floor = np.percentile([c['sharp'] for c in group], SHARPNESS_PERCENTILE)
+            kept.extend(c for c in group if c['sharp'] >= floor)
         dropped_sharpness = len(candidates) - len(kept)
         candidates = kept
     stats = {
