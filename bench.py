@@ -24,6 +24,10 @@ MODELS = ['hyperswap_1a_256', 'hyperswap_1b_256', 'hyperswap_1c_256',
           'ghost_1_256', 'ghost_2_256', 'ghost_3_256',
           'simswap_256', 'inswapper_128_fp16']
 PIXEL_BOOST = '1024x1024'   # valid for every model above at the pinned commit
+RETRY_PAUSE = 5             # seconds to let the contending workload finish
+RETRY_LABEL = 'transient CoreML failure'
+# CoreML reports contention as a failed prediction, not as a busy signal
+TRANSIENT_MARKERS = ('Unable to compute the prediction', 'CoreML', 'ML Program')
 PHOTO_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp'}   # same set swap.py's IMAGE_EXTS uses
 
 
@@ -85,6 +89,11 @@ def reference_embedding(face_dir: Path):
         embeddings.append(most_prominent(detected).embedding_norm)
     ref = np.mean(embeddings, axis=0)
     return ref / np.linalg.norm(ref)
+
+
+def is_transient(tail: str) -> bool:
+    """A contended CoreML run looks like a broken model. Tell them apart."""
+    return any(marker in (tail or '') for marker in TRANSIENT_MARKERS)
 
 
 def run_swap(model: str, target: Path, out: Path, sources: list[str]) -> tuple[bool, str]:
@@ -232,6 +241,17 @@ def main() -> None:
         for target in targets:
             out = model_dir / target.name
             ok, tail = run_swap(model, target, out, sources)
+            if not ok and is_transient(tail):
+                # CoreML fails the whole prediction when something else on the
+                # machine is competing for ANE/GPU ("Unable to compute the
+                # prediction using ML Program"). Dropping the model on a first
+                # failure silently removes it from the ranking, which is how a
+                # contended run crowned inswapper while hyperswap_1b/1c — the
+                # two that held facial structure best — vanished entirely.
+                print(f'  {model} on {target.name}: {RETRY_LABEL}, retrying',
+                      file=sys.stderr, flush=True)
+                time.sleep(RETRY_PAUSE)
+                ok, tail = run_swap(model, target, out, sources)
             if not ok:
                 failed = tail or 'subprocess produced no output'
                 break
