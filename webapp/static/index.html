@@ -283,17 +283,20 @@ async function loadFaces() {
   }
   const add = document.createElement('div');
   add.className = 'face';
+  // video/* MUST lead: with image/* first, iOS hands Safari a re-encoded
+  // low-res copy of a picked video (measured: a 4K capture arrived 360x480).
+  // The clip picker below has always had this order and carries 4K intact.
   add.innerHTML = `<div class="blank">+</div><span>new face</span>
-    <input class="overlay" type="file" accept="image/*,video/*">`;
+    <input class="overlay" type="file" accept="video/*,image/*">`;
   add.querySelector('input').onchange = e => { state.pendingFaceName = null; onFacePicked(e); };
   box.appendChild(add);
   const sel = faces.find(f => f.name === state.face);
   $('faceInfo').hidden = !sel;
   if (sel) {
     $('faceInfo').innerHTML =
-      `${sel.count} photo${sel.count > 1 ? 's' : ''} of ${sel.name} — add a video ` +
-      `of them for every angle <span class="chip mini pickwrap">+ photo/video` +
-      `<input class="overlay" type="file" accept="image/*,video/*"></span> ` +
+      `${sel.count} photo${sel.count > 1 ? 's' : ''} of ${sel.name} — a capture video ` +
+      `rebuilds their angles <span class="chip mini pickwrap">+ photo/video` +
+      `<input class="overlay" type="file" accept="video/*,image/*"></span> ` +
       `<button class="chip mini" id="delFace">remove</button>`;
     $('faceInfo').querySelector('.pickwrap input').onchange = e => {
       state.pendingFaceName = sel.name; onFacePicked(e);
@@ -324,10 +327,10 @@ async function onFacePicked(e) {
   const saved = await res.json();
   state.face = saved.name;
   e.target.value = '';
-  box.textContent = saved.added > 1
-    ? `${saved.name}: pulled ${saved.added} angles from that video (${saved.count} total) ✓`
+  box.textContent = saved.job
+    ? `${saved.name}: building identity from that video — watch the queue below`
     : `${saved.name}: ${saved.count} photo${saved.count > 1 ? 's' : ''} ✓`;
-  loadFaces(); ready();
+  loadFaces(); ready(); poll();
 }
 
 async function loadClips() {
@@ -665,26 +668,33 @@ function fmtAge(j) {
   return j.status + ' · ' + j.quality;
 }
 
+const identityDone = new Set();
+
 async function poll() {
   const jobs = await fetch('api/jobs').then(r => r.json()).catch(() => null);
   if (!jobs) return;
+  for (const j of jobs) {                   // a finished build changes the gallery
+    if (j.kind === 'identity' && j.status === 'done' && !identityDone.has(j.id)) {
+      identityDone.add(j.id); loadFaces();
+    }
+  }
   const strip = $('strip');
   strip.innerHTML = jobs.length ? '' : '<div class="empty">nothing cooking yet</div>';
   for (const j of jobs) {
     const div = document.createElement('div');
     div.className = 'job ' + j.status;
     const spin = (j.status === 'running' || j.status === 'queued') ? '<div class="spin"></div>' : '';
-    const link = j.status === 'done'
-      ? (j.kind === 'photo'
+    const link = j.status !== 'done' || j.kind === 'identity'
+      ? ''                                  // an identity build has no file to save
+      : (j.kind === 'photo'
           ? `<a href="api/jobs/${j.id}/result" download>save</a>`
           : `<a href="api/jobs/${j.id}/preview" download>save</a>
-             <a class="hd" href="api/jobs/${j.id}/result" download>HD</a>`)
-      : '';
+             <a class="hd" href="api/jobs/${j.id}/result" download>HD</a>`);
     const extras = (j.audio ? ' · 🎤' : '') + (j.captions ? ' · 💬' : '')
                  + (j.edit ? ' · 🎭' + Object.keys(j.edit).length : '');
     const sub = j.status === 'failed'
       ? `<div class="sub err">${j.error || 'failed'}</div>`
-      : `<div class="sub">${fmtAge(j)}${extras}</div>`;
+      : `<div class="sub">${j.summary || fmtAge(j)}${extras}</div>`;
     const bar = (j.status === 'running' && j.progress)
       ? `<div class="bar"><i style="width:${j.progress.pct}%"></i></div>` : '';
     const lead = (j.kind === 'photo' && j.status === 'done')

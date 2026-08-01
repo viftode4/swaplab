@@ -66,6 +66,13 @@ Photo mode: toggle to "photo", pick or upload a picture (HEIC fine), tap a
 numbered face on the image, then tap whose face goes in — or tap 👥 everyone
 to swap every face at once.
 
+Adding a **photo** to a person appends it. Adding a **capture video** queues an
+`identity.py` build that *rebuilds* that person from the video (old set archived
+to `faces/<person>/.old-<stamp>/`); the clip stays in the job folder, so a
+rebuild never needs a re-upload. The build reports its own reason for failing —
+"only N usable face candidates … dominant filter: size" means the video came in
+too small (see the capture checklist below).
+
 ## Best identity + picking your swapper
 
 Build a strong multi-angle identity from a short capture video (slow head

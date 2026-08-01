@@ -36,6 +36,7 @@ INBOX = (Path.home() / 'Library/Mobile Documents/com~apple~CloudDocs'
 THUMBS = CLIPS / '.thumbs'
 JOBS = ROOT / 'jobs'
 SWAP = ROOT / 'swap.py'
+IDENTITY = ROOT / 'identity.py'
 PYTHON = ROOT / '.venv' / 'bin' / 'python'
 INDEX = Path(__file__).resolve().parent / 'static' / 'index.html'
 
@@ -226,57 +227,42 @@ def api_face_thumb(name: str) -> FileResponse:
     return FileResponse(photos[0])
 
 
-FACE_VIDEO_SAMPLES = 8
-
-
-def sample_face_video(clip: Path, person: Path, start_index: int) -> int:
-    """Pull evenly spaced stills out of a video of one person.
-
-    A single frontal photo can only describe a face head-on; frames from a
-    few seconds of someone moving cover the angles the swap actually needs.
-    """
-    ffmpeg = shutil.which('ffmpeg')
-    if not ffmpeg:
-        return 0
-    probe = subprocess.run(
-        [shutil.which('ffprobe'), '-v', 'error', '-show_entries',
-         'format=duration', '-of', 'csv=p=0', str(clip)],
-        capture_output=True, text=True)
-    try:
-        duration = float(probe.stdout.strip())
-    except ValueError:
-        return 0
-    taken = 0
-    for i in range(FACE_VIDEO_SAMPLES):
-        # skip the very start and end, where phone clips tend to be blurry
-        at = duration * (i + 1) / (FACE_VIDEO_SAMPLES + 1)
-        dest = person / f'photo-{start_index + taken + 1}.jpg'
-        result = subprocess.run(
-            [ffmpeg, '-y', '-v', 'error', '-ss', f'{at:.2f}', '-i', str(clip),
-             '-frames:v', '1', '-q:v', '2', str(dest)], capture_output=True)
-        if result.returncode == 0 and dest.is_file():
-            taken += 1
-    return taken
-
-
 @app.post('/api/faces')
 async def api_add_face(name: str = Form(...), photo: UploadFile = File(...)) -> dict:
     ext = Path(photo.filename or '').suffix.lower()
     if ext not in IMAGE_EXTS | VIDEO_EXTS:
         raise HTTPException(400, 'a face needs a photo or a short video of them')
     person = FACES / slug(name)
-    person.mkdir(parents=True, exist_ok=True)
-    count = len(person_photos(person))
+    # no mkdir yet: a failed identity build would leave an empty person behind.
+    # identity.py creates the dir itself once it has crops to write.
+    count = len(person_photos(person)) if person.is_dir() else 0
 
     if ext in VIDEO_EXTS:
-        clip = person / f'.source{ext}'
-        await save_upload(photo, clip)
-        added = sample_face_video(clip, person, count)
-        clip.unlink(missing_ok=True)
-        if not added:
-            raise HTTPException(400, 'could not read frames from that video')
-        return {'name': person.name, 'count': count + added, 'added': added}
+        # A capture video REBUILDS the identity through identity.py (pose
+        # buckets, sharpness ranking, size/score floors) rather than grabbing
+        # evenly spaced stills. It runs the detector over every sampled frame,
+        # so it belongs in the job queue, not in this request.
+        job_id = f'{time.strftime("%Y%m%d-%H%M%S")}-{secrets.token_hex(3)}'
+        path = JOBS / job_id
+        path.mkdir(parents=True)
+        # the source clip stays in the job folder: rebuilding with different
+        # settings never needs a re-upload from the phone
+        await save_upload(photo, path / f'input{ext}')
+        write_job(path, {
+            'id': job_id,
+            'kind': 'identity',
+            'status': 'queued',
+            'quality': 'identity',
+            'person': person.name,
+            'face': person.name,
+            'video': f'identity ← {photo.filename}',
+            'created': time.time(),
+            'error': None,
+        })
+        wake.set()
+        return {'name': person.name, 'count': count, 'added': 0, 'job': job_id}
 
+    person.mkdir(parents=True, exist_ok=True)
     dest = person / f'photo-{count + 1}{ext}'
     await save_upload(photo, dest)
     normalize_photo(dest)
@@ -606,7 +592,16 @@ def make_preview(path: Path) -> None:
 
 
 def run_job(path: Path, data: dict) -> None:
-    if data.get('kind') == 'photo':
+    result_file = None
+    if data.get('kind') == 'identity':
+        clip = next((f for f in path.iterdir() if f.stem == 'input'), None)
+        if not clip or not data.get('person'):
+            data.update(status='failed', error='job folder is missing input files')
+            write_job(path, data)
+            return
+        command = [str(PYTHON), str(IDENTITY), '--video', str(clip),
+                   '--person', data['person']]
+    elif data.get('kind') == 'photo':
         photo_file = next((f for f in path.iterdir() if f.stem == 'input'), None)
         if not photo_file:
             data.update(status='failed', error='job folder is missing input files')
@@ -647,22 +642,35 @@ def run_job(path: Path, data: dict) -> None:
             command += ['--enhancer-model', data['enhancer_model']]
     log = (path / 'swap.log').open('w')
     # own process group so a server restart can clean up the whole render tree
+    # unbuffered, or the tool's block-buffered stdout flushes at exit and lands
+    # AFTER the stderr failure line, scrambling the log's chronology
     process = subprocess.Popen(
         command, stdout=log, stderr=subprocess.STDOUT, cwd=ROOT,
+        env={**os.environ, 'PYTHONUNBUFFERED': '1'},
         start_new_session=True)
     data.update(status='running', started=time.time(), error=None, pid=process.pid)
     write_job(path, data)
     returncode = process.wait()
     log.close()
     data['pid'] = None
-    if returncode == 0 and result_file.is_file():
-        if data.get('kind') != 'photo':
+    if returncode == 0 and (result_file is None or result_file.is_file()):
+        if data.get('kind') not in ('photo', 'identity'):
             make_preview(path)
         data.update(status='done', finished=time.time())
+        if data.get('kind') == 'identity':
+            # identity.py's last line reports what was written and what was
+            # archived — the only useful outcome of a build with no result file
+            report = (path / 'swap.log').read_text(errors='replace').strip()
+            data['summary'] = report.splitlines()[-1] if report else None
     else:
-        tail = (path / 'swap.log').read_text(errors='replace')[-400:].strip()
+        # our tools fail with a "<tool>.py: <reason>" line; prefer it over the
+        # last line, which is whatever progress output happened to come last
+        text = (path / 'swap.log').read_text(errors='replace').strip()
+        lines = text.splitlines()
+        reason = next((line for line in reversed(lines)
+                       if re.match(r'^\w+\.py: ', line)), None)
         data.update(status='failed', finished=time.time(),
-                    error=tail.splitlines()[-1] if tail else 'swap failed')
+                    error=reason or (lines[-1][-400:] if lines else 'swap failed'))
     write_job(path, data)
 
 
