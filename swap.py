@@ -14,6 +14,7 @@ voices only. Label output as AI-generated when posting.
 import argparse
 import json
 import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -461,14 +462,46 @@ def burn_captions(out: Path) -> None:
 CHUNK_FRAMES = 150
 
 
+def explain_exit(code: int, where: str = '') -> str:
+    """A negative code is a signal — the OS killed it, it did not fail.
+
+    Reporting SIGKILL as "no face in photo/video" sent a memory diagnosis
+    looking at the clip's content instead of at the render's memory use.
+    """
+    if code == -signal.SIGKILL:
+        return (f'facefusion was killed{where} — this is macOS reclaiming memory, '
+                'not a problem with the clip. Frame times drift upward for a while '
+                'first; chunked rendering is what prevents it.')
+    if code < 0:
+        return f'facefusion was killed by signal {-code}{where}'
+    return (f'facefusion exited with {code}{where} '
+            '(no face in photo/video and codec issues are the usual causes)')
+
+
 def video_frames(path: Path) -> int:
+    """Frame count for the chunking decision — 0 only if truly unknowable.
+
+    csv=p=0 can emit a trailing empty field: an iPhone clip carrying extra
+    data streams probes as "1098,", and int() on that raised ValueError,
+    which returned 0, which read as "too short to chunk". A 1098-frame clip
+    then rendered unchunked and macOS killed it at frame 547. Parse the
+    first number out of whatever ffprobe formats, and if counting fails
+    entirely, estimate from duration — a rough count still decides chunking
+    correctly, and being wrong the other way costs a render.
+    """
     probe = subprocess.run(
         [shutil.which('ffprobe'), '-v', 'error', '-select_streams', 'v:0',
          '-count_packets', '-show_entries', 'stream=nb_read_packets',
          '-of', 'csv=p=0', str(path)], capture_output=True, text=True)
+    for field in probe.stdout.replace(',', ' ').split():
+        try:
+            return int(field)
+        except ValueError:
+            continue
     try:
-        return int(probe.stdout.strip())
-    except ValueError:
+        _, _, fps = video_stats(path)
+        return int(video_duration(path) * fps)
+    except (ValueError, ZeroDivisionError, IndexError):
         return 0
 
 
@@ -488,8 +521,8 @@ def run_in_chunks(command: list[str], work_out: Path, frame_count: int) -> None:
         if result.returncode != 0 or not piece.is_file():
             for done in chunks:
                 done.unlink(missing_ok=True)
-            fail(f'facefusion exited with {result.returncode} on chunk '
-                 f'{index + 1} of {total}')
+            fail(explain_exit(result.returncode,
+                              f' on chunk {index + 1} of {total}'))
         chunks.append(piece)
 
     listing = work_out.with_name(f'.{work_out.stem}.chunks.txt')
@@ -590,8 +623,7 @@ def run_facefusion(target: Path, output: Path, processors: list[str],
     else:
         result = subprocess.run(command, cwd=FACEFUSION)
         if result.returncode != 0:
-            fail(f'facefusion exited with {result.returncode} '
-                 '(no face in photo/video and codec issues are the usual causes)')
+            fail(explain_exit(result.returncode))
     if not output.is_file():
         fail('facefusion reported success but produced no output file')
 
@@ -672,8 +704,14 @@ def main() -> None:
         mappings.append((index, person))
     if mappings and (face is not None or args.all_faces):
         fail('--map replaces --face/--all-faces — use one or the other')
-    if (mappings or args.all_faces) and not is_image(video):
-        fail('--all-faces and --map work on photos (image targets) only')
+    # --map stays photo-only for a real reason: it chains reference-position
+    # passes, and face #2 in frame 1 is not face #2 in frame 300. --all-faces
+    # is just --face-selector-mode many, which facefusion applies per frame
+    # with no index to keep stable, so video is fine.
+    if mappings and not is_image(video):
+        fail('--map works on photos (image targets) only — face numbering is '
+             'per-frame on video, so #2 is not the same person throughout. '
+             'Use --all-faces to turn everyone into one person.')
     if args.all_faces and face is None:
         fail('--all-faces needs --face to say who everyone becomes')
     if mappings and (audio is not None or edits):

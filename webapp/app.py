@@ -374,6 +374,7 @@ async def api_create_job(
     captions: bool = Form(False),
     edit: str = Form(''),
     screen_recording: bool = Form(False),
+    all_faces: bool = Form(False),
     photo_name: str = Form(''),
     mapping: str = Form(''),
 ) -> dict:
@@ -513,6 +514,7 @@ async def api_create_job(
         'captions': captions,
         'edit': edits or None,
         'screen_recording': screen_recording,
+        'all_faces': all_faces,
         'created': time.time(),
         'error': None,
     })
@@ -769,6 +771,8 @@ def run_job(path: Path, data: dict) -> None:
             command += ['--captions']
         if data.get('screen_recording'):
             command += ['--screen-recording']
+        if data.get('all_faces'):
+            command += ['--all-faces']
         for control, value in (data.get('edit') or {}).items():
             command += ['--edit', f'{control}={value}']
         if data.get('swapper_model'):

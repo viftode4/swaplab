@@ -210,6 +210,7 @@
   <label class="chip" for="audioInput" id="voiceChip">🎤 add a voice</label>
   <button class="chip" id="capChip">💬 captions</button>
   <button class="chip" id="screenChip">📱 screen recording</button>
+  <button class="chip" id="allChip">👥 everyone is them</button>
 </div>
 <div class="extras videoonly" style="margin-top:10px">
   <button class="chip" id="editChip">🎭 face editor</button>
@@ -255,7 +256,7 @@
 <script>
 const state = { face: null, pendingFaceName: null, video: null, clip: null,
                 quality: 'good', audio: null, captions: false,
-                screenRecording: false,
+                screenRecording: false, allFaces: false,
                 mode: 'clip', photo: null, photoScan: null, mapping: {}, selBox: null };
 
 // a phone has no console we can read: show failures and report them home
@@ -569,6 +570,10 @@ $('screenChip').onclick = () => {
   state.screenRecording = !state.screenRecording;
   $('screenChip').classList.toggle('sel', state.screenRecording);
 };
+$('allChip').onclick = () => {      // every detected face, not just the main one
+  state.allFaces = !state.allFaces;
+  $('allChip').classList.toggle('sel', state.allFaces);
+};
 const sliders = [...document.querySelectorAll('#editor input[type=range]')];
 
 function edits() {
@@ -623,6 +628,7 @@ $('go').onclick = async () => {
     if (state.audio) fd.append('audio', state.audio);
     if (state.captions) fd.append('captions', 'true');
     if (state.screenRecording) fd.append('screen_recording', 'true');
+    if (state.allFaces) fd.append('all_faces', 'true');
     const ed = edits();
     if (Object.keys(ed).length) fd.append('edit', JSON.stringify(ed));
   }
@@ -719,7 +725,8 @@ async function poll() {
           ? `<a href="api/jobs/${j.id}/result${q}" download>save</a>`
           : `<a href="api/jobs/${j.id}/preview" download>save</a>
              <a class="hd" href="api/jobs/${j.id}/result" download>HD</a>`);
-    const extras = (j.audio ? ' · 🎤' : '') + (j.captions ? ' · 💬' : '')
+    const extras = (j.all_faces ? ' · 👥' : '')
+                 + (j.audio ? ' · 🎤' : '') + (j.captions ? ' · 💬' : '')
                  + (j.edit ? ' · 🎭' + Object.keys(j.edit).length : '');
     const sub = j.status === 'failed'
       ? `<div class="sub err">${j.error || 'failed'}</div>`
