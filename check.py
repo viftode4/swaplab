@@ -28,6 +28,7 @@ PROBE_W, PROBE_H = 180, 344
 STATIC_DIFF = 0.35      # mean gray delta below this = duplicated frame
 SCENE_DIFF = 20.0       # above this = scene cut, not shimmer
 SHIMMER_WARN = 3.0      # face-block p90 above this is visible flicker
+DURATION_WARN = 0.1     # seconds; catches chunk-boundary A/V padding
 
 
 def gray_frames(path: Path) -> np.ndarray:
@@ -40,6 +41,17 @@ def gray_frames(path: Path) -> np.ndarray:
     count = len(raw) // (PROBE_W * PROBE_H)
     return (np.frombuffer(raw[:count * PROBE_W * PROBE_H], dtype=np.uint8)
             .reshape(count, PROBE_H, PROBE_W).astype(np.int16))
+
+
+def duration(path: Path) -> float:
+    probe = subprocess.run(
+        [shutil.which('ffprobe'), '-v', 'error', '-show_entries',
+         'format=duration', '-of', 'csv=p=0', str(path)],
+        capture_output=True, text=True)
+    try:
+        return float(probe.stdout.strip())
+    except ValueError:
+        return 0.0
 
 
 def face_block_diff(delta: np.ndarray, block: int = 96) -> float:
@@ -75,15 +87,38 @@ def analyze(target: Path, result: Path) -> dict:
     near_cut = np.zeros(count, dtype=bool)
     for c in cuts:
         near_cut[max(0, c - 3):c + 5] = True
-    dropouts = []
+    candidates = []
     for i in range(count):
         window = np.median(swap_delta[max(0, i - 15):i + 15])
         if window > 8.0 and swap_delta[i] < 0.4 * window and not near_cut[i]:
-            dropouts.append(i)
+            candidates.append(i)
+
+    # A face moving behind a foreground person makes the swapped-pixel area
+    # taper down and back up over several frames. The old neighbourhood-only
+    # test called that a dropout even though tracked face boxes were still
+    # changed. A real detector miss has a sharp entry and recovery: keep only
+    # candidate runs whose low point collapses against both immediate sides.
+    dropouts = []
+    position = 0
+    while position < len(candidates):
+        start = candidates[position]
+        end = start
+        while (position + 1 < len(candidates)
+               and candidates[position + 1] == end + 1):
+            position += 1
+            end += 1
+        low = np.median(swap_delta[start:end + 1])
+        before = np.median(swap_delta[max(0, start - 3):start])
+        after = np.median(swap_delta[end + 1:min(count, end + 4)])
+        if before and after and low < 0.45 * before and low < 0.45 * after:
+            dropouts.extend(range(start, end + 1))
+        position += 1
 
     return {
         'target_frames': len(inp),
         'result_frames': len(out),
+        'target_duration': duration(target),
+        'result_duration': duration(result),
         'duplicate_ratio': float(frozen.mean()) if count > 1 else 0.0,
         'shimmer_pairs': len(shimmer),
         'shimmer_p50': float(np.median(shimmer)) if len(shimmer) else 0.0,
@@ -101,6 +136,13 @@ def report(stats: dict) -> bool:
           f"{stats['duplicate_ratio']:.0%} duplicated in target")
     if stats['target_frames'] != stats['result_frames']:
         print('check: WARN frame count changed — timing will drift')
+        clean = False
+    duration_delta = abs(stats['target_duration'] - stats['result_duration'])
+    print(f"check: target {stats['target_duration']:.3f}s, "
+          f"result {stats['result_duration']:.3f}s "
+          f"(delta {duration_delta:.3f}s)")
+    if duration_delta > DURATION_WARN:
+        print('check: WARN duration changed — audio/video timing will drift')
         clean = False
     if stats['shimmer_pairs']:
         print(f"check: flicker score (face change on frozen frames) "

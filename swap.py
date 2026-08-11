@@ -17,6 +17,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -120,6 +121,29 @@ PHOTO_STACK = (['face_swapper', 'expression_restorer', 'face_enhancer'], [
     '--face-selector-order', 'left-right',
 ])
 
+# swap only — the expression restorer and enhancer are most of a photo's
+# render time but barely change who the face reads as, which is all a
+# likeness preview has to answer
+PREVIEW_STACK = (['face_swapper'], [
+    '--face-mask-types', 'box', 'region',
+    '--face-mask-blur', '0.4',
+    '--face-swapper-pixel-boost', '512x512',
+    '--output-image-quality', '85',
+    '--face-selector-order', 'left-right',
+])
+
+
+def likeness_weight(likeness: int) -> str:
+    """0..100 slider -> facefusion --face-swapper-weight in its 0.05 grid.
+
+    The weight balances source vs target embeddings: 0.0 leans back toward
+    the original person, 0.5 is the pure source identity (the default),
+    1.0 extrapolates past the source for maximum likeness.
+    """
+    if not 0 <= likeness <= 100:
+        fail(f'--likeness {likeness} outside 0..100')
+    return f'{round(likeness / 5) * 0.05:.2f}'
+
 
 def face_photos(path: Path) -> list[Path]:
     """A face is one photo or a directory of photos (averaged identity)."""
@@ -146,8 +170,33 @@ def fail(message: str) -> 'NoReturn':
 MAX_LONG_SIDE = 1920
 
 # Apple silicon has a dedicated encode engine: several times faster than
-# libx264 and it leaves the CPU free for the actual inference work
-VIDEO_ENCODE = ['-c:v', 'h264_videotoolbox', '-q:v', '65']
+# libx264 and it leaves the CPU free for inference. Repeated renders can make
+# VideoToolbox refuse a new compression session (-12908), though, so probe it
+# once per job and fall back before opening a real input stream.
+_VIDEO_ENCODE: list[str] | None = None
+
+
+def video_encode() -> list[str]:
+    global _VIDEO_ENCODE
+    if _VIDEO_ENCODE is not None:
+        return _VIDEO_ENCODE
+
+    ffmpeg = shutil.which('ffmpeg') or fail('ffmpeg is required')
+    probe = subprocess.run(
+        [ffmpeg, '-hide_banner', '-loglevel', 'error', '-f', 'lavfi',
+         '-i', 'color=c=black:s=64x64:r=1', '-frames:v', '1',
+         '-c:v', 'h264_videotoolbox', '-allow_sw', '1', '-f', 'null', '-'],
+        capture_output=True, text=True)
+    if probe.returncode == 0:
+        _VIDEO_ENCODE = [
+            '-c:v', 'h264_videotoolbox', '-allow_sw', '1', '-q:v', '65'
+        ]
+    else:
+        _VIDEO_ENCODE = [
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '18'
+        ]
+        print('VideoToolbox unavailable; using libx264', flush=True)
+    return _VIDEO_ENCODE
 
 
 def video_stats(path: Path) -> tuple[int, int, float]:
@@ -234,7 +283,7 @@ def normalize_target(video: Path, work_dir: Path, crop_content: bool = False) ->
     print(f'preparing {width}x{height}@{fps:.0f}', flush=True)
     result = subprocess.run(
         [shutil.which('ffmpeg'), '-y', '-v', 'error', '-i', str(video),
-         '-vf', ','.join(filters), *VIDEO_ENCODE, '-c:a', 'copy', str(scaled)],
+         '-vf', ','.join(filters), *video_encode(), '-c:a', 'copy', str(scaled)],
         capture_output=True, text=True)
     if result.returncode != 0 or not scaled.is_file():
         fail(f'could not normalize the clip:\n{result.stderr.strip()}')
@@ -304,7 +353,7 @@ def raw_encoder(dest: Path, width: int, height: int, rate: float,
                '-s', f'{width}x{height}', '-r', f'{rate:.6f}', '-i', '-',
                '-i', str(audio_from), '-map', '0:v', '-map', '1:a?',
                *(['-vf', filters] if filters else []),
-               *VIDEO_ENCODE, '-c:a', 'copy', str(dest)]
+               *video_encode(), '-c:a', 'copy', str(dest)]
     return subprocess.Popen(command, stdin=subprocess.PIPE,
                             stderr=subprocess.DEVNULL)
 
@@ -446,7 +495,7 @@ def burn_captions(out: Path) -> None:
     burn = subprocess.run(
         [ffmpeg, '-y', '-v', 'error', '-i', str(out), *inputs,
          '-filter_complex', ';'.join(chain), '-map', f'[{current}]',
-         '-map', '0:a?', *VIDEO_ENCODE, '-c:a', 'copy', str(tmp)],
+         '-map', '0:a?', *video_encode(), '-c:a', 'copy', str(tmp)],
         capture_output=True, text=True)
     for png, _, _ in cards:
         png.unlink(missing_ok=True)
@@ -458,8 +507,18 @@ def burn_captions(out: Path) -> None:
 
 # facefusion's memory use grows as it works — frame times on a long clip drift
 # from 2s to 10s and macOS eventually kills it. Each chunk is a fresh process,
-# so whatever leaked is reclaimed between them.
-CHUNK_FRAMES = 150
+# so whatever leaked is reclaimed between them. The multi-detector crowd test
+# was killed at frame 78 without tracking and frame 49 with tracking enabled.
+# Keep 30-frame checkpoint boundaries so existing renders resume, but render
+# new checkpoints as two fresh processes. The tracker reads its context from
+# the original video by absolute frame number, so these process boundaries do
+# not shorten its 10-frame window. Fifteen avoids the repeatable kill on 29.
+CHUNK_FRAMES = 30
+CHUNK_ATTEMPTS = 2
+MAX_RENDER_FRAMES = 15
+MIN_CHUNK_FRAMES = 8
+CHUNK_RETRY_PAUSE = 15
+CHUNK_COOLDOWN = 5
 
 
 def explain_exit(code: int, where: str = '') -> str:
@@ -507,35 +566,127 @@ def video_frames(path: Path) -> int:
 
 def run_in_chunks(command: list[str], work_out: Path, frame_count: int) -> None:
     output_at = command.index('--output-path') + 1
+    target_at = command.index('--target-path') + 1
+    target = Path(command[target_at])
     total = -(-frame_count // CHUNK_FRAMES)
     chunks = []
-    for index, start in enumerate(range(0, frame_count, CHUNK_FRAMES)):
-        end = min(start + CHUNK_FRAMES, frame_count)
-        piece = work_out.with_name(f'.{work_out.stem}.part{index}{work_out.suffix}')
-        print(f'chunk {index + 1}/{total} (frames {start}-{end})', flush=True)
+
+    def has_expected_frames(piece: Path, expected_frames: int) -> bool:
+        probe = subprocess.run(
+            [shutil.which('ffprobe'), '-v', 'error', '-select_streams', 'v:0',
+             '-show_entries', 'stream=nb_frames', '-of', 'csv=p=0', str(piece)],
+            capture_output=True, text=True)
+        try:
+            existing_frames = int(probe.stdout.strip().split(',')[0])
+        except (ValueError, IndexError):
+            existing_frames = 0
+        return probe.returncode == 0 and existing_frames >= max(1, expected_frames - 1)
+
+    def strip_part_audio(piece: Path) -> None:
+        """Make concat use video duration, not each part's longer AAC tail."""
+        video_only = piece.with_name(f'.{piece.stem}.video{piece.suffix}')
+        result = subprocess.run(
+            [shutil.which('ffmpeg'), '-y', '-v', 'error', '-i', str(piece),
+             '-map', '0:v:0', '-an', '-c:v', 'copy', str(video_only)],
+            capture_output=True, text=True)
+        if result.returncode != 0 or not video_only.is_file():
+            video_only.unlink(missing_ok=True)
+            fail(f'could not remove chunk audio before concat:\n'
+                 f'{result.stderr.strip()}')
+        video_only.replace(piece)
+
+    def join_parts(parts: list[Path], output: Path,
+                   delete_parts: bool = True) -> None:
+        listing = output.with_name(f'.{output.stem}.children.txt')
+        listing.write_text(''.join(f"file '{part.name}'\n" for part in parts))
+        concat = subprocess.run(
+            [shutil.which('ffmpeg'), '-y', '-v', 'error', '-f', 'concat',
+             '-safe', '0', '-i', str(listing), '-map', '0:v:0', '-an',
+             '-c:v', 'copy', str(output)],
+            capture_output=True, text=True)
+        listing.unlink(missing_ok=True)
+        if concat.returncode != 0:
+            fail(f'could not join split chunk; kept its child parts for resume:\n'
+                 f'{concat.stderr.strip()}')
+        if delete_parts:
+            for part in parts:
+                part.unlink(missing_ok=True)
+
+    def render_piece(piece: Path, start: int, end: int, label: str) -> None:
+        expected_frames = end - start
+        if has_expected_frames(piece, expected_frames):
+            print(f'{label}: resuming completed part', flush=True)
+            strip_part_audio(piece)
+            return
+
+        midpoint = start + expected_frames // 2
+        left = piece.with_name(f'{piece.stem}a{piece.suffix}')
+        right = piece.with_name(f'{piece.stem}b{piece.suffix}')
+        should_split = expected_frames > MAX_RENDER_FRAMES
+        has_split_checkpoint = left.exists() or right.exists()
+        if expected_frames > MIN_CHUNK_FRAMES and (should_split or has_split_checkpoint):
+            action = 'resuming' if has_split_checkpoint else 'rendering'
+            print(f'{label}: {action} split parts', flush=True)
+            render_piece(left, start, midpoint, f'{label}a')
+            render_piece(right, midpoint, end, f'{label}b')
+            join_parts([left, right], piece)
+            return
+
         chunk_command = list(command)
         chunk_command[output_at] = str(piece)
         chunk_command += ['--trim-frame-start', str(start),
                           '--trim-frame-end', str(end)]
-        result = subprocess.run(chunk_command, cwd=FACEFUSION)
-        if result.returncode != 0 or not piece.is_file():
-            for done in chunks:
-                done.unlink(missing_ok=True)
+        for attempt in range(1, CHUNK_ATTEMPTS + 1):
+            piece.unlink(missing_ok=True)
+            result = subprocess.run(chunk_command, cwd=FACEFUSION)
+            if result.returncode == 0 and piece.is_file():
+                strip_part_audio(piece)
+                break
+            if attempt < CHUNK_ATTEMPTS:
+                print(f'{label} failed; cooling down '
+                      f'{CHUNK_RETRY_PAUSE}s before retry '
+                      f'{attempt + 1}/{CHUNK_ATTEMPTS}', flush=True)
+                time.sleep(CHUNK_RETRY_PAUSE)
+        else:
+            if expected_frames > MIN_CHUNK_FRAMES:
+                print(f'{label}: splitting frames {start}-{end} after repeated failure',
+                      flush=True)
+                render_piece(left, start, midpoint, f'{label}a')
+                render_piece(right, midpoint, end, f'{label}b')
+                join_parts([left, right], piece)
+                return
             fail(explain_exit(result.returncode,
-                              f' on chunk {index + 1} of {total}'))
-        chunks.append(piece)
+                              f' on {label}') +
+                 f'; kept {len(chunks)} completed chunk(s) for resume')
 
-    listing = work_out.with_name(f'.{work_out.stem}.chunks.txt')
-    listing.write_text(''.join(f"file '{p.name}'\n" for p in chunks))
-    concat = subprocess.run(
-        [shutil.which('ffmpeg'), '-y', '-v', 'error', '-f', 'concat',
-         '-safe', '0', '-i', str(listing), '-c', 'copy', str(work_out)],
+    for index, start in enumerate(range(0, frame_count, CHUNK_FRAMES)):
+        end = min(start + CHUNK_FRAMES, frame_count)
+        piece = work_out.with_name(f'.{work_out.stem}.part{index}{work_out.suffix}')
+        label = f'chunk {index + 1}/{total}'
+        print(f'{label} (frames {start}-{end})', flush=True)
+        render_piece(piece, start, end, label)
+        chunks.append(piece)
+        if index + 1 < total:
+            time.sleep(CHUNK_COOLDOWN)
+
+    # Every FaceFusion part carries a slightly longer AAC stream. The concat
+    # demuxer waits for that audio before starting the next part, adding about
+    # 20 ms of frozen video per boundary. Join video only, then mux the target
+    # audio once so a chunked render keeps the source duration and A/V sync.
+    join_parts(chunks, work_out, delete_parts=False)
+    muxed = work_out.with_name(f'.{work_out.stem}.muxed{work_out.suffix}')
+    mux = subprocess.run(
+        [shutil.which('ffmpeg'), '-y', '-v', 'error', '-i', str(work_out),
+         '-i', str(target), '-map', '0:v:0', '-map', '1:a:0?', '-c', 'copy',
+         '-movflags', '+faststart', str(muxed)],
         capture_output=True, text=True)
-    listing.unlink(missing_ok=True)
+    if mux.returncode != 0 or not muxed.is_file():
+        muxed.unlink(missing_ok=True)
+        fail(f'could not restore target audio; kept all rendered chunks:\n'
+             f'{mux.stderr.strip()}')
+    muxed.replace(work_out)
     for piece in chunks:
         piece.unlink(missing_ok=True)
-    if concat.returncode != 0:
-        fail(f'could not join the rendered chunks:\n{concat.stderr.strip()}')
 
 
 def stabilize(out: Path) -> None:
@@ -553,7 +704,7 @@ def stabilize(out: Path) -> None:
     tmp = out.with_name(f'.{out.stem}.stable{out.suffix}')
     result = subprocess.run(
         [ffmpeg, '-y', '-v', 'error', '-i', str(out),
-         '-vf', 'hqdn3d=2:1:20:20', *VIDEO_ENCODE, '-c:a', 'copy', str(tmp)],
+         '-vf', 'hqdn3d=2:1:20:20', *video_encode(), '-c:a', 'copy', str(tmp)],
         capture_output=True, text=True)
     if result.returncode == 0 and tmp.is_file():
         tmp.replace(out)
@@ -613,8 +764,10 @@ def run_facefusion(target: Path, output: Path, processors: list[str],
         '--execution-providers', 'cpu' if cpu else 'coreml',
         '--video-memory-strategy', 'moderate',
         # measured on this Mac: 62s at 1 thread, 57s at 4, 56s at 8 for the
-        # same 60 frames — 4 takes nearly all of the win at less memory
-        '--execution-thread-count', '4',
+        # same 60 frames. The small speed win is not worth four concurrent
+        # frame pipelines here: multi-detector tracking was OOM-killed at
+        # frame 49 with 4 threads.
+        '--execution-thread-count', '1',
         *extra,
     ]
     frame_count = video_frames(target) if not is_image(target) else 0
@@ -664,6 +817,12 @@ def main() -> None:
     parser.add_argument('--map', action='append', metavar='N=PERSON',
                         help='photo face #N (left to right, from --list-faces) '
                              'becomes this person — photo or directory (repeatable)')
+    parser.add_argument('--likeness', type=int, default=50, metavar='0..100',
+                        help='how strongly the result resembles the new face: '
+                             '0 subtle, 50 normal (default), 100 unmistakable')
+    parser.add_argument('--preview', action='store_true',
+                        help='photo only: quick swap-only render to judge '
+                             'likeness — skips the expression/enhance passes')
     parser.add_argument('--out', required=False, help='output video path')
     parser.add_argument('--quality', choices=QUALITY, default='good')
     parser.add_argument('--cpu', action='store_true', help='force CPU (skip CoreML)')
@@ -750,14 +909,18 @@ def main() -> None:
         if args.quality != 'good':          # 'good' is just the default
             print('photo target: --quality is ignored, photos always run '
                   'the max stack', flush=True)
-        processors, extra = PHOTO_STACK
+        processors, extra = PREVIEW_STACK if args.preview else PHOTO_STACK
     else:
+        if args.preview:
+            fail('--preview works on photos')
         processors, extra = QUALITY[args.quality]
     sources = []
     if face is None and not mappings:
         processors, extra = [], []          # lip-sync only, no swap
     elif face is not None:
         sources.extend(str(p) for p in face_photos(face))
+    if 'face_swapper' in processors and args.likeness != 50:
+        extra = [*extra, '--face-swapper-weight', likeness_weight(args.likeness)]
     if args.swapper_model:
         extra = [*extra, '--face-swapper-model', args.swapper_model]
     if args.enhancer_model:
@@ -837,7 +1000,7 @@ def main() -> None:
                 if remux.returncode != 0:  # container mismatch — re-encode instead
                     remux = subprocess.run(
                         [ffmpeg, '-y', '-v', 'error', '-i', str(work_out),
-                         *VIDEO_ENCODE, '-c:a', 'aac', str(out)],
+                         *video_encode(), '-c:a', 'aac', str(out)],
                         capture_output=True, text=True)
                 work_out.unlink(missing_ok=True)
                 if remux.returncode != 0 or not out.is_file():

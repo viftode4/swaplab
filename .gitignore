@@ -1,10 +1,18 @@
 # engine (cloned, pinned by commit in README)
 facefusion/
 
+# optional diffusion engine (cloned locally; includes downloaded models)
+comfyui/
+
 # python
 .venv/
 __pycache__/
 *.pyc
+
+# local secrets and environment overrides
+.env
+.env.*
+!.env.example
 
 # private media — never commit faces or footage
 faces/
@@ -19,6 +27,9 @@ photos/
 
 # models
 *.onnx
+*.safetensors
+*.ckpt
+*.pth
 .assets/
 
 # omc state

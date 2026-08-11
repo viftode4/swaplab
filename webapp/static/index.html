@@ -170,6 +170,16 @@
                overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .pick.on span { color: var(--go); }
   .empty { color: var(--dim); font-size: 13px; padding: 6px 2px; }
+  #likebox { margin-top: 10px; }
+  .prevwrap { position: relative; margin-top: 8px; }
+  .prevwrap img { max-width: 100%; border-radius: 10px; display: block; }
+  /* veil, not replace: the old preview stays put while the next one cooks */
+  .prevveil { position: absolute; inset: 0; display: flex; align-items: center;
+              justify-content: center; background: rgba(20, 22, 26, 0.45);
+              border-radius: 10px; }
+  /* no picture under it yet — let the spinner take its own space */
+  .prevwrap img[hidden] ~ .prevveil { position: static; background: none;
+                                      padding: 14px 0; }
   /* .faces/.quality/.extras set display: flex, which beats the UA's
      [hidden] { display: none } — force it back so hidden actually hides */
   [hidden] { display: none !important; }
@@ -196,6 +206,18 @@
 <div id="photoStage" hidden>
   <div class="stagewrap"><img id="stageImg" alt=""></div>
   <div class="faceinfo" id="mapInfo"></div>
+</div>
+<div id="likebox" hidden>
+  <div class="extras" style="margin-bottom:6px">
+    <button class="chip" id="memeChip">🔥 max likeness</button>
+  </div>
+  <label class="srow">likeness<input type="range" id="likeSlider"
+         min="0" max="100" step="5" value="50"><b>50</b></label>
+  <div class="prevwrap">
+    <img id="prevImg" alt="" hidden>
+    <div class="prevveil" id="prevVeil" hidden><div class="spin"></div></div>
+  </div>
+  <div class="faceinfo" id="prevNote"></div>
 </div>
 
 <div class="step videoonly"><b>3</b>how fancy</div>
@@ -257,7 +279,8 @@
 const state = { face: null, pendingFaceName: null, video: null, clip: null,
                 quality: 'good', audio: null, captions: false,
                 screenRecording: false, allFaces: false,
-                mode: 'clip', photo: null, photoScan: null, mapping: {}, selBox: null };
+                mode: 'clip', photo: null, photoScan: null, mapping: {}, selBox: null,
+                likeness: 50, meme: false };
 
 // a phone has no console we can read: show failures and report them home
 function report(where, detail) {
@@ -435,7 +458,7 @@ for (const chip of document.querySelectorAll('.modechip')) {
     const photoMode = state.mode === 'photo';
     for (const el of document.querySelectorAll('.videoonly')) el.hidden = photoMode;
     if (photoMode) $('editor').hidden = true;   // chip reopens it in clip mode
-    paintMode(); ready();
+    paintMode(); refreshPreview(); ready();
   };
 }
 
@@ -546,7 +569,73 @@ function paintMode() {
   };
   $('mapInfo').appendChild(all);
   ready();
+  refreshPreview();
 }
+
+// ---- quick likeness preview: fires as soon as a photo has a face assigned,
+// and again whenever the mapping or the likeness slider changes ----
+let prevSeq = 0, prevBusy = false, prevAgain = false, prevKey = null;
+
+const previewReady = () => state.mode === 'photo' && state.photo &&
+  (state.mapping.all || Object.keys(state.mapping).some(k => k !== 'all'));
+
+function refreshPreview() {
+  $('likebox').hidden = !(state.mode === 'photo' && state.photo);
+  if (!previewReady()) {
+    prevKey = null; prevSeq++;              // orphan any in-flight render
+    prevBusy = false; prevAgain = false;
+    $('prevImg').hidden = true; $('prevVeil').hidden = true;
+    $('prevNote').textContent = '';
+    return;
+  }
+  const key = JSON.stringify([state.photo, state.mapping, state.likeness]);
+  if (key === prevKey) return;              // this exact preview is shown/cooking
+  if (prevBusy) { prevAgain = true; return; }
+  prevBusy = true; prevKey = key;
+  const seq = ++prevSeq;
+  $('prevVeil').hidden = false;
+  $('prevNote').textContent = 'cooking a quick preview — the full render looks even better…';
+  const fd = new FormData();
+  fd.append('photo_name', state.photo);
+  fd.append('mapping', JSON.stringify(state.mapping));
+  fd.append('likeness', state.likeness);
+  fetch('api/preview', { method: 'POST', body: fd })
+    .then(async r => {
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || `server said ${r.status}`);
+      return r.blob();
+    })
+    .then(blob => {
+      if (seq !== prevSeq) return;          // superseded while cooking
+      const img = $('prevImg');
+      if (img.src) URL.revokeObjectURL(img.src);
+      img.src = URL.createObjectURL(blob);
+      img.hidden = false;
+      $('prevNote').textContent = 'quick preview (swap only) — SWAP IT runs the full-quality pass';
+    })
+    .catch(err => {
+      if (seq !== prevSeq) return;
+      prevKey = null;                       // let the next tap retry
+      $('prevNote').textContent = 'preview failed: ' + err.message;
+    })
+    .finally(() => {
+      if (seq !== prevSeq) return;
+      prevBusy = false;
+      $('prevVeil').hidden = true;
+      if (prevAgain) { prevAgain = false; refreshPreview(); }
+    });
+}
+
+$('likeSlider').oninput = e => {
+  state.likeness = +e.target.value;
+  e.target.nextElementSibling.textContent = e.target.value;
+};
+$('likeSlider').onchange = () => refreshPreview();
+// swap first, then a light diffusion pass over the face for likeness the
+// swappers alone can't reach — slower (~2-3 min per face), same photo otherwise
+$('memeChip').onclick = () => {
+  state.meme = !state.meme;
+  $('memeChip').classList.toggle('sel', state.meme);
+};
 
 $('voiceChip').onclick = e => {
   if (state.audio) {          // second tap clears instead of opening the picker
@@ -620,6 +709,8 @@ $('go').onclick = async () => {
   if (state.mode === 'photo') {
     fd.append('photo_name', state.photo);
     fd.append('mapping', JSON.stringify(state.mapping));
+    fd.append('likeness', state.likeness);
+    if (state.meme) fd.append('meme', 'true');
   } else {
     if (state.video) fd.append('video', state.video);
     else fd.append('clip_name', state.clip);
@@ -678,6 +769,8 @@ function fmtAge(j) {
     const t = j.started ? `${Math.round(Date.now() / 1000 - j.started)}s` : '';
     if (j.kind === 'photo' && j.models)      // one render per swapper, in turn
       return `model ${(j.results || []).length + 1} of ${j.models.length} · ${t}`;
+    if (j.kind === 'meme' && j.heads)        // one diffusion render per head
+      return `head ${Math.min((j.done_heads || 0) + 1, j.heads)} of ${j.heads} · ${t}`;
     return j.progress ? `${j.progress.stage} ${j.progress.pct}% · ${t}`
                       : `starting up · ${t}`;
   }
@@ -700,6 +793,7 @@ const modelLabel = m => m
   .replace('hyperswap_', 'hyper ').replace('ghost_', 'ghost ')
   .replace('inswapper', 'inswap');
 
+let stripSig = null;         // last rendered state — unchanged means don't touch the DOM
 async function poll() {
   const jobs = await fetch('api/jobs').then(r => r.json()).catch(() => null);
   if (!jobs) return;
@@ -709,6 +803,14 @@ async function poll() {
     }
   }
   const strip = $('strip');
+  // rebuilding the strip resets .picks scroll and kills an in-flight swipe, so
+  // leave the DOM alone unless the jobs changed (running jobs tick a timer)
+  const sig = JSON.stringify([jobs, photoPick]);
+  if (sig === stripSig && !jobs.some(j => j.status === 'running')) return;
+  stripSig = sig;
+  const scrolls = {};                       // picker scroll survives a real rebuild
+  for (const p of strip.querySelectorAll('.picks'))
+    scrolls[p.dataset.job] = p.scrollLeft;
   strip.innerHTML = jobs.length ? '' : '<div class="empty">nothing cooking yet</div>';
   for (const j of jobs) {
     const div = document.createElement('div');
@@ -721,7 +823,7 @@ async function poll() {
     const q = picks.length ? `?model=${encodeURIComponent(chosen)}` : '';
     const link = j.status !== 'done' || j.kind === 'identity'
       ? ''                                  // an identity build has no file to save
-      : (j.kind === 'photo'
+      : (j.kind === 'photo' || j.kind === 'meme'
           ? `<a href="api/jobs/${j.id}/result${q}" download>save</a>`
           : `<a href="api/jobs/${j.id}/preview" download>save</a>
              <a class="hd" href="api/jobs/${j.id}/result" download>HD</a>`);
@@ -734,11 +836,11 @@ async function poll() {
     const bar = (j.status === 'running' && j.progress)
       ? `<div class="bar"><i style="width:${j.progress.pct}%"></i></div>` : '';
     // thumb, not result: eight full-size renders would be ~20MB to a phone
-    const lead = (j.kind === 'photo' && j.status === 'done')
+    const lead = ((j.kind === 'photo' || j.kind === 'meme') && j.status === 'done')
       ? `<a href="api/jobs/${j.id}/result${q}" target="_blank">
            <img class="jobthumb" src="api/jobs/${j.id}/thumb${q}"></a>` : spin;
     const picker = picks.length > 1
-      ? `<div class="picks">` + picks.map(r =>
+      ? `<div class="picks" data-job="${j.id}">` + picks.map(r =>
           `<button class="pick${r.model === chosen ? ' on' : ''}" data-model="${r.model}">
              <img src="api/jobs/${j.id}/thumb?model=${encodeURIComponent(r.model)}">
              <span>${modelLabel(r.model)}</span></button>`).join('') + `</div>`
@@ -747,6 +849,8 @@ async function poll() {
     for (const button of div.querySelectorAll('.pick'))
       button.onclick = () => { photoPick[j.id] = button.dataset.model; poll(); };
     strip.appendChild(div);
+    const p = div.querySelector('.picks');
+    if (p && scrolls[p.dataset.job]) p.scrollLeft = scrolls[p.dataset.job];
   }
 }
 

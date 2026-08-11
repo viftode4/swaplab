@@ -10,6 +10,7 @@ job re-runnable. One worker thread = one CoreML job at a time.
 """
 
 import argparse
+import io
 import json
 import os
 import re
@@ -22,7 +23,7 @@ import time
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse
 
@@ -37,6 +38,7 @@ THUMBS = CLIPS / '.thumbs'
 JOBS = ROOT / 'jobs'
 SWAP = ROOT / 'swap.py'
 IDENTITY = ROOT / 'identity.py'
+MEME = ROOT / 'meme.py'
 PYTHON = ROOT / '.venv' / 'bin' / 'python'
 INDEX = Path(__file__).resolve().parent / 'static' / 'index.html'
 
@@ -63,6 +65,10 @@ EDIT_CONTROLS = {'smile', 'pout', 'grim', 'purse', 'lips', 'mouth-x', 'mouth-y',
 
 app = FastAPI(title='SwapLab')
 wake = threading.Event()
+# one render at a time, previews included: concurrent CoreML work fails with
+# "Unable to compute the prediction" — that is how a contended benchmark run
+# silently lost hyperswap_1b and 1c
+render_lock = threading.Lock()
 
 
 def slug(name: str) -> str:
@@ -363,6 +369,92 @@ def api_photo_faces(file_name: str) -> dict:
     return scan_photo(photo_path(file_name))
 
 
+def resolve_plan(source: Path, mapping: str) -> tuple[dict, dict]:
+    """Validate a photo mapping and resolve its people to face dirs."""
+    try:
+        plan = json.loads(mapping) if mapping else {}
+    except ValueError:
+        raise HTTPException(400, 'mapping must be a JSON object')
+    if not isinstance(plan, dict) or not plan:
+        raise HTTPException(400, 'assign at least one face')
+    found = len(scan_photo(source)['faces'])
+    persons = {}
+    for key, person_name in plan.items():
+        if key != 'all':
+            try:
+                index = int(key)
+            except ValueError:
+                raise HTTPException(400, f'bad face number: {key}')
+            if not 0 <= index < found:
+                raise HTTPException(400, f'face #{key} not found — the photo has {found}')
+        try:
+            person = person_dir(str(person_name))
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            raise HTTPException(400, f'unknown face: {person_name}')
+        photos = person_photos(person) if person.is_dir() else []
+        if not photos:
+            raise HTTPException(400, f'unknown face: {person_name}')
+        persons[key] = person
+    if 'all' in plan and len(plan) > 1:
+        raise HTTPException(400, 'use "all" alone, or number the faces')
+    return plan, persons
+
+
+def stage_photo(source: Path, path: Path, persons: dict) -> None:
+    """Lay out a job folder: the target photo plus one face dir per mapping."""
+    path.mkdir(parents=True)
+    shutil.copy(source, path / f'input{source.suffix.lower()}')
+    for key, person in persons.items():
+        slot = path / ('face' if key == 'all' else f'face-{key}')
+        slot.mkdir()
+        for photo_file in person_photos(person):
+            shutil.copy(photo_file, slot / photo_file.name)
+
+
+def render_preview(source: Path, mapping: str, likeness: int) -> bytes:
+    """Swap-only render at the asked likeness, downscaled for the phone.
+
+    Throwaway by design: a temp folder, never a queue entry, deleted on the
+    way out. Waits on render_lock so it never fights a real render for CoreML.
+    """
+    _, persons = resolve_plan(source, mapping)
+    path = JOBS / f'.preview-{secrets.token_hex(4)}'
+    try:
+        stage_photo(source, path, persons)
+        photo_file = next(f for f in path.iterdir() if f.stem == 'input')
+        out = path / f'result{photo_file.suffix.lower()}'
+        command = photo_command(path, photo_file, out) + ['--preview']
+        if likeness != 50:
+            command += ['--likeness', str(likeness)]
+        with render_lock:
+            result = subprocess.run(
+                command, cwd=ROOT, timeout=600,
+                env={**os.environ, 'PYTHONUNBUFFERED': '1'},
+                capture_output=True, text=True)
+        if result.returncode != 0 or not out.is_file():
+            raise HTTPException(500, failure_reason(result.stdout + result.stderr))
+        from PIL import Image
+        img = Image.open(out)
+        img.thumbnail((1000, 4000))
+        buffer = io.BytesIO()
+        img.convert('RGB').save(buffer, 'JPEG', quality=82)
+        return buffer.getvalue()
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+@app.post('/api/preview')
+async def api_preview(photo_name: str = Form(''), mapping: str = Form(''),
+                      likeness: int = Form(50)) -> Response:
+    if not 0 <= likeness <= 100:
+        raise HTTPException(400, 'likeness must be 0..100')
+    source = photo_path(photo_name)         # 404s on nonsense
+    image = await run_in_threadpool(render_preview, source, mapping, likeness)
+    return Response(content=image, media_type='image/jpeg')
+
+
 @app.post('/api/jobs')
 async def api_create_job(
     video: UploadFile | None = File(None),
@@ -377,51 +469,40 @@ async def api_create_job(
     all_faces: bool = Form(False),
     photo_name: str = Form(''),
     mapping: str = Form(''),
+    likeness: int = Form(50),
+    meme: bool = Form(False),
 ) -> dict:
     if photo_name:
+        if not 0 <= likeness <= 100:
+            raise HTTPException(400, 'likeness must be 0..100')
         source = photo_path(photo_name)     # 404s on nonsense
-        try:
-            plan = json.loads(mapping) if mapping else {}
-        except ValueError:
-            raise HTTPException(400, 'mapping must be a JSON object')
-        if not isinstance(plan, dict) or not plan:
-            raise HTTPException(400, 'assign at least one face')
-        scan = await run_in_threadpool(scan_photo, source)
-        found = len(scan['faces'])
-        persons = {}
-        for key, person_name in plan.items():
-            if key != 'all':
-                try:
-                    index = int(key)
-                except ValueError:
-                    raise HTTPException(400, f'bad face number: {key}')
-                if not 0 <= index < found:
-                    raise HTTPException(400, f'face #{key} not found — the photo has {found}')
-            try:
-                person = person_dir(str(person_name))
-            except HTTPException as exc:
-                if exc.status_code != 404:
-                    raise
-                raise HTTPException(400, f'unknown face: {person_name}')
-            photos = person_photos(person) if person.is_dir() else []
-            if not photos:
-                raise HTTPException(400, f'unknown face: {person_name}')
-            persons[key] = person
-        if 'all' in plan and len(plan) > 1:
-            raise HTTPException(400, 'use "all" alone, or number the faces')
+        plan, persons = await run_in_threadpool(resolve_plan, source, mapping)
 
         job_id = f'{time.strftime("%Y%m%d-%H%M%S")}-{secrets.token_hex(3)}'
         path = JOBS / job_id
-        path.mkdir(parents=True)
-        shutil.copy(source, path / f'input{source.suffix.lower()}')
-        for key, person in persons.items():
-            slot = path / ('face' if key == 'all' else f'face-{key}')
-            slot.mkdir()
-            for photo_file in person_photos(person):
-                shutil.copy(photo_file, slot / photo_file.name)
+        stage_photo(source, path, persons)
+        if meme:
+            # whole-head diffusion render: one pass per face, no model sweep
+            found = len(scan_photo(source)['faces'])
+            indices = list(range(found)) if 'all' in plan \
+                else sorted(int(k) for k in plan)
+            write_job(path, {
+                'id': job_id, 'kind': 'meme', 'status': 'queued',
+                'quality': 'meme', 'likeness': likeness,
+                'heads': len(indices), 'done_heads': 0, 'indices': indices,
+                'face': ', '.join(
+                    (f'{int(k) + 1}→{plan[k]}' if k != 'all' else f'everyone→{plan[k]}')
+                    for k in sorted(plan, key=lambda k: (k != 'all', int(k) if k != 'all' else -1))
+                ),
+                'video': photo_name, 'audio': None, 'captions': False,
+                'edit': None, 'screen_recording': False,
+                'created': time.time(), 'error': None,
+            })
+            wake.set()
+            return {'id': job_id}
         write_job(path, {
             'id': job_id, 'kind': 'photo', 'status': 'queued',
-            'quality': 'best',
+            'quality': 'best', 'likeness': likeness,
             'models': SWAPPER_MODELS, 'done_models': 0, 'results': [],
             'face': ', '.join(
                 (f'{int(k) + 1}→{plan[k]}' if k != 'all' else f'everyone→{plan[k]}')
@@ -655,7 +736,7 @@ def launch(command: list[str], log_path: Path, path: Path, data: dict) -> tuple[
     AFTER the stderr failure line, scrambling the log's chronology. Own process
     group so a server restart can clean up the whole render tree.
     """
-    with log_path.open('w') as log:
+    with render_lock, log_path.open('w') as log:
         process = subprocess.Popen(
             command, stdout=log, stderr=subprocess.STDOUT, cwd=ROOT,
             env={**os.environ, 'PYTHONUNBUFFERED': '1'},
@@ -715,6 +796,8 @@ def run_photo_job(path: Path, data: dict) -> None:
         out = path / (f'result-{model}{suffix}' if model else f'result{suffix}')
         log = path / (f'swap-{model}.log' if model else 'swap.log')
         command = photo_command(path, photo_file, out)
+        if data.get('likeness', 50) != 50:
+            command += ['--likeness', str(data['likeness'])]
         if model:
             command += ['--swapper-model', model]
         returncode, text = launch(command, log, path, data)
@@ -740,9 +823,58 @@ def run_photo_job(path: Path, data: dict) -> None:
     write_job(path, data)
 
 
+def run_meme_job(path: Path, data: dict) -> None:
+    """Whole-head renders via meme.py, chained when several faces map.
+
+    Each pass rescans the intermediate image, so left-to-right indices are
+    re-derived the same way swap.py's --map chain does it.
+    """
+    photo_file = next((f for f in path.iterdir() if f.stem == 'input'), None)
+    if not photo_file:
+        data.update(status='failed', error='job folder is missing input files')
+        write_job(path, data)
+        return
+    all_dir = path / 'face'
+    if all_dir.is_dir():
+        steps = [(index, all_dir) for index in data.get('indices') or [0]]
+    else:
+        steps = sorted((int(slot.name.split('-', 1)[1]), slot)
+                       for slot in path.glob('face-*'))
+    data.update(status='running', started=time.time(), error=None,
+                heads=len(steps), done_heads=0)
+    write_job(path, data)
+
+    current = photo_file
+    for number, (index, slot) in enumerate(steps):
+        last = number == len(steps) - 1
+        out = path / (f'result{photo_file.suffix}' if last
+                      else f'step-{number}{photo_file.suffix}')
+        command = [str(PYTHON), str(MEME),
+                   '--photo', str(current), '--face', str(slot),
+                   '--index', str(index),
+                   '--likeness', str(data.get('likeness', 50)),
+                   '--out', str(out)]
+        returncode, text = launch(command, path / f'meme-{number}.log', path, data)
+        data['pid'] = None
+        if returncode != 0 or not out.is_file():
+            data.update(status='failed', finished=time.time(),
+                        error=failure_reason(text))
+            write_job(path, data)
+            return
+        current = out
+        data['done_heads'] = number + 1
+        write_job(path, data)
+    make_photo_thumb(current)
+    data.update(status='done', finished=time.time())
+    write_job(path, data)
+
+
 def run_job(path: Path, data: dict) -> None:
     if data.get('kind') == 'photo':
         run_photo_job(path, data)
+        return
+    if data.get('kind') == 'meme':
+        run_meme_job(path, data)
         return
     result_file = None
     if data.get('kind') == 'identity':
